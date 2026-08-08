@@ -9,8 +9,6 @@ DEFAULT_REPOSITORY="${DEFAULT_MOUNT}/omarchy-restic-v2"
 REPOSITORY="${OMARCHY_RESTIC_REPOSITORY:-${RESTIC_REPOSITORY:-${DEFAULT_REPOSITORY}}}"
 SNAPSHOT_ID="latest"
 INSTALL_TOOLS=0
-RESTORE_DOCKER_VOLUMES=0
-REPLACE_DOCKER_VOLUMES=0
 YES=0
 PLAN_ONLY=0
 PASSWORD_FILE=""
@@ -26,10 +24,8 @@ e verifica os dados em uma área temporária; depois sincroniza o HOME atual,
 preservando cópias dos arquivos que forem sobrescritos.
 
 Opções:
-  --full                    restaura HOME, oferece ferramentas e Docker
+  --full                    restaura HOME e oferece ferramentas
   --install-tools           instala ferramentas-base via pacman ou apt
-  --restore-docker-volumes restaura volumes Docker ausentes
-  --replace-docker-volumes substitui dados de volumes existentes (destrutivo)
   --snapshot ID             usa um snapshot específico em vez de latest
   --yes                     não pede confirmações; use somente após revisar
   --plan                    mostra o plano sem acessar o repositório
@@ -40,7 +36,6 @@ Variáveis opcionais:
   RESTIC_REPOSITORY          alternativa ao caminho acima
   OMARCHY_RESTIC_MOUNT       ponto de montagem do HD externo
   OMARCHY_RESTIC_WORKDIR     área temporária para a restauração
-  OMARCHY_RESTIC_DOCKER_IMAGE imagem usada nos volumes Docker
 
 Exemplo completo após instalar o Omarchy:
   omarchy-restic-restore --full
@@ -113,17 +108,9 @@ while (($# > 0)); do
   case "$1" in
     --full)
       INSTALL_TOOLS=1
-      RESTORE_DOCKER_VOLUMES=1
       ;;
     --install-tools)
       INSTALL_TOOLS=1
-      ;;
-    --restore-docker-volumes)
-      RESTORE_DOCKER_VOLUMES=1
-      ;;
-    --replace-docker-volumes)
-      RESTORE_DOCKER_VOLUMES=1
-      REPLACE_DOCKER_VOLUMES=1
       ;;
     --snapshot)
       shift
@@ -158,11 +145,7 @@ if (( PLAN_ONLY == 1 )); then
   else
     printf '  ferramentas: não instalar; use --install-tools ou --full\n'
   fi
-  if (( RESTORE_DOCKER_VOLUMES == 1 )); then
-    printf '  Docker: restaurar volumes ausentes; existentes serão preservados\n'
-  else
-    printf '  Docker: não restaurar volumes; use --restore-docker-volumes ou --full\n'
-  fi
+  printf '  Docker: restaurar apenas configurações e inventário; volumes não são incluídos\n'
   exit 0
 fi
 
@@ -281,73 +264,9 @@ install_flatpaks() {
   done <"$flatpak_ids_file"
 }
 
-restore_docker_volumes() {
-  local manifest_directory
-  local volume_directory
-  local docker_image
-  local archive_path
-  local archive_name
-  local volume_name
-  local -a archives
-
-  command -v docker >/dev/null 2>&1 || { warn 'Docker não está instalado; volumes não foram restaurados'; return 0; }
-  if ! docker info >/dev/null 2>&1; then
-    if command -v sudo >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
-      sudo systemctl start docker >/dev/null 2>&1 || true
-    fi
-  fi
-  docker info >/dev/null 2>&1 || { warn 'daemon Docker indisponível; volumes não foram restaurados'; return 0; }
-
-  manifest_directory="$(dirname "$MANIFEST_PATH")"
-  volume_directory="$manifest_directory/../docker/volumes"
-  [[ -d "$volume_directory" ]] || { warn 'nenhum arquivo de volume Docker encontrado'; return 0; }
-  docker_image="$(awk -F= '$1 == "docker_archive_image" {print substr($0, index($0, "=") + 1); exit}' "$MANIFEST_PATH")"
-  docker_image="${docker_image:-${OMARCHY_RESTIC_DOCKER_IMAGE:-busybox:1.36}}"
-  shopt -s nullglob
-  archives=("$volume_directory"/*.tar.gz)
-  shopt -u nullglob
-  ((${#archives[@]} > 0)) || { warn 'nenhum volume Docker arquivado'; return 0; }
-
-  log "restaurando volumes Docker ausentes; volumes existentes serão preservados"
-  for archive_path in "${archives[@]}"; do
-    archive_name="$(basename "$archive_path")"
-    volume_name="${archive_name%.tar.gz}"
-    if docker volume inspect "$volume_name" >/dev/null 2>&1; then
-      if (( REPLACE_DOCKER_VOLUMES == 0 )); then
-        warn "volume existente preservado: $volume_name"
-        continue
-      fi
-      ask_yes_no "SUBSTITUIR o conteúdo do volume Docker $volume_name?" || {
-        warn "volume preservado: $volume_name"
-        continue
-      }
-      docker run --rm --network none --read-only \
-        --mount "type=volume,src=${volume_name},dst=/destination" \
-        "$docker_image" \
-        sh -c 'find /destination -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +'
-    else
-      docker volume create "$volume_name" >/dev/null
-    fi
-
-    if docker run --rm --network none --read-only \
-      --mount "type=volume,src=${volume_name},dst=/destination" \
-      --mount "type=bind,src=${volume_directory},dst=/backup,readonly" \
-      "$docker_image" \
-      sh -c 'tar -xzf "/backup/$1" -C /destination' sh "$archive_name"; then
-      log "volume restaurado: $volume_name"
-    else
-      warn "falha ao restaurar volume: $volume_name"
-    fi
-  done
-}
-
 if (( INSTALL_TOOLS == 1 )); then
   install_base_tools
   install_flatpaks "$(dirname "$MANIFEST_PATH")/../packages/flatpak-application-ids.txt"
-fi
-
-if (( RESTORE_DOCKER_VOLUMES == 1 )); then
-  restore_docker_volumes
 fi
 
 log "restauração concluída; a área temporária será removida"

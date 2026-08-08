@@ -7,8 +7,6 @@ CURRENT_HOME="${HOME:?HOME não está definido}"
 DEFAULT_MOUNT="/media/${CURRENT_USER}/Backup"
 DEFAULT_REPOSITORY="${DEFAULT_MOUNT}/omarchy-restic-v2"
 REPOSITORY="${OMARCHY_RESTIC_REPOSITORY:-${RESTIC_REPOSITORY:-${DEFAULT_REPOSITORY}}}"
-DOCKER_ARCHIVE_IMAGE="${OMARCHY_RESTIC_DOCKER_IMAGE:-busybox:1.36}"
-SKIP_DOCKER_VOLUMES=0
 PASSWORD_FILE=""
 STAGING_DIR=""
 
@@ -21,17 +19,15 @@ Cria um snapshot Restic criptografado com o conteúdo importante da migração:
   - todo o HOME, exceto caches e artefatos regeneráveis;
   - projetos, worktrees, documentos, Obsidian e configurações;
   - inventário de pacotes e ferramentas;
-  - metadados Docker e arquivos dos volumes nomeados, quando possível.
+  - inventário e metadados Docker, sem o conteúdo dos volumes.
 
 Opções:
-  --no-docker-volumes  não arquiva o conteúdo dos volumes Docker
-  -h, --help           mostra esta ajuda
+  -h, --help  mostra esta ajuda
 
 Variáveis opcionais:
   OMARCHY_RESTIC_REPOSITORY  caminho do repositório Restic
   RESTIC_REPOSITORY          alternativa ao caminho acima
   OMARCHY_RESTIC_MOUNT       ponto de montagem do HD externo
-  OMARCHY_RESTIC_DOCKER_IMAGE imagem usada para arquivar volumes
 
 Padrão do repositório:
   /media/$USER/Backup/omarchy-restic-v2
@@ -87,9 +83,6 @@ cleanup() {
 
 for argument in "$@"; do
   case "$argument" in
-    --no-docker-volumes)
-      SKIP_DOCKER_VOLUMES=1
-      ;;
     -h|--help)
       usage
       exit 0
@@ -137,9 +130,7 @@ restic_cmd snapshots --latest 1 >/dev/null
 STAGING_DIR="$(mktemp -d "$BACKUP_MOUNT/.omarchy-restic-staging.XXXXXX")"
 chmod 700 "$STAGING_DIR"
 MANIFEST_DIR="$STAGING_DIR/manifest"
-DOCKER_DIR="$STAGING_DIR/docker"
-DOCKER_VOLUME_DIR="$DOCKER_DIR/volumes"
-mkdir -p "$MANIFEST_DIR/tools" "$MANIFEST_DIR/packages" "$MANIFEST_DIR/git" "$DOCKER_VOLUME_DIR"
+mkdir -p "$MANIFEST_DIR/tools" "$MANIFEST_DIR/packages" "$MANIFEST_DIR/git"
 
 log "coletando inventário de pacotes e ferramentas"
 if command -v apt-mark >/dev/null 2>&1; then
@@ -205,9 +196,7 @@ else
   printf 'diretório não encontrado: %s\n' "$CURRENT_HOME/RubymineProjects" >"$MANIFEST_DIR/git/rubymine-projects-status.txt"
 fi
 
-DOCKER_AVAILABLE=0
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-  DOCKER_AVAILABLE=1
   log "coletando inventário Docker"
   docker context ls >"$MANIFEST_DIR/docker-contexts.txt" || true
   docker ps -a --no-trunc >"$MANIFEST_DIR/docker-containers.txt" || true
@@ -235,33 +224,6 @@ else
   : >"$MANIFEST_DIR/docker-volumes.json"
 fi
 
-DOCKER_VOLUME_STATUS="$MANIFEST_DIR/docker-volume-archives.txt"
-if (( SKIP_DOCKER_VOLUMES == 1 )); then
-  printf 'volumes Docker desabilitados por --no-docker-volumes\n' >"$DOCKER_VOLUME_STATUS"
-elif (( DOCKER_AVAILABLE == 0 )); then
-  printf 'volumes Docker não arquivados: Docker indisponível\n' >"$DOCKER_VOLUME_STATUS"
-else
-  log "arquivando volumes Docker em modo somente leitura"
-  printf 'volume\tstatus\tarquivo\n' >"$DOCKER_VOLUME_STATUS"
-  log "a imagem $DOCKER_ARCHIVE_IMAGE será baixada pelo Docker se não estiver local"
-  mapfile -t volume_names < <(docker volume ls -q)
-  for volume_name in "${volume_names[@]}"; do
-    [[ -n "$volume_name" ]] || continue
-    archive_path="$DOCKER_VOLUME_DIR/${volume_name}.tar.gz"
-    if docker run --rm --network none --read-only \
-      --mount "type=volume,src=${volume_name},dst=/source,readonly" \
-      --mount "type=bind,src=${DOCKER_VOLUME_DIR},dst=/backup" \
-      "$DOCKER_ARCHIVE_IMAGE" \
-      sh -c 'tar -czf "/backup/$1.tar.gz" -C /source .' sh "$volume_name"; then
-      chmod u+rw "$archive_path" 2>/dev/null || true
-      printf '%s\tOK\t%s\n' "$volume_name" "$archive_path" >>"$DOCKER_VOLUME_STATUS"
-    else
-      warn "não foi possível arquivar o volume Docker: $volume_name"
-      printf '%s\tSKIPPED\tarchive-failed\n' "$volume_name" >>"$DOCKER_VOLUME_STATUS"
-    fi
-  done
-fi
-
 MANIFEST_FILE="$MANIFEST_DIR/omarchy-restic-manifest.txt"
 {
   printf 'format=omarchy-restic-migration-v1\n'
@@ -270,8 +232,7 @@ MANIFEST_FILE="$MANIFEST_DIR/omarchy-restic-manifest.txt"
   printf 'source_home=%s\n' "$CURRENT_HOME"
   printf 'source_hostname=%s\n' "$(hostname)"
   printf 'repository=%s\n' "$REPOSITORY"
-  printf 'docker_archive_image=%s\n' "$DOCKER_ARCHIVE_IMAGE"
-  printf 'docker_volume_archives=%s\n' "$DOCKER_VOLUME_STATUS"
+  printf 'docker_volume_content=not-backed-up\n'
   printf 'excluded_paths=cache,trash,node_modules,vendor/bundle,.bundle,tmp,log,coverage,.terraform\n'
 } >"$MANIFEST_FILE"
 

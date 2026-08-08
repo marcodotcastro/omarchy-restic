@@ -13,7 +13,7 @@ O backup inclui:
 - documentos, Obsidian e configurações de usuário;
 - `.env`, `.ssh`, `.gnupg`, configurações do Git e ferramentas;
 - inventário de pacotes, versões, gems e pacotes npm;
-- inventário Docker e arquivos dos volumes Docker nomeados, quando possível.
+- inventário e metadados Docker, sem o conteúdo dos volumes.
 
 São excluídos somente conteúdos regeneráveis: caches, Lixeira, `node_modules`, `vendor/bundle`, `.bundle`, `tmp`, `log`, `coverage` e `.terraform` dentro do `$HOME`.
 
@@ -25,7 +25,7 @@ O conteúdo do repositório Restic é criptografado. A perda da senha torna o ba
 - Restic 0.12 ou mais recente;
 - `rsync` para restauração;
 - HD externo montado;
-- Docker opcional para inventário e volumes.
+- Docker opcional para inventário.
 
 O caminho padrão do repositório é:
 
@@ -60,8 +60,6 @@ findmnt -T "$RESTIC_REPOSITORY"
 restic snapshots
 ```
 
-Antes de fazer backup de bancos em Docker, pare os containers que escrevem dados, quando possível. O arquivamento de volume é somente leitura, mas não substitui um `pg_dump` transacional.
-
 Execute o backup completo com um único comando:
 
 ```bash
@@ -72,7 +70,7 @@ O script:
 
 1. pede a senha uma única vez;
 2. cria um inventário do sistema e das ferramentas;
-3. arquiva volumes Docker nomeados, quando o Docker estiver disponível;
+3. registra containers, imagens, redes, volumes e projetos Compose Docker;
 4. cria um snapshot com a tag `omarchy-migration`;
 5. executa `restic check`.
 
@@ -81,12 +79,6 @@ Ao final, confirme que apareceu um snapshot e `no errors were found`:
 ```bash
 restic snapshots --tag omarchy-migration --latest 1
 restic check
-```
-
-Se não quiser arquivar volumes Docker nesta execução:
-
-```bash
-./omarchy-restic-backup --no-docker-volumes
 ```
 
 ## 2. Guardar os scripts fora do disco que será apagado
@@ -130,7 +122,7 @@ Faça a restauração completa, com confirmação interativa:
 "$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-restore" --full
 ```
 
-O `--full` restaura o `$HOME`, oferece a instalação das ferramentas-base e recupera volumes Docker ausentes. Ele não usa `--delete`; os arquivos existentes que forem sobrescritos são preservados em:
+O `--full` restaura o `$HOME` e oferece a instalação das ferramentas-base. O inventário Docker é restaurado como parte dos arquivos de configuração, mas o conteúdo dos volumes não faz parte deste backup. O script não usa `--delete`; os arquivos existentes que forem sobrescritos são preservados em:
 
 ```text
 ~/.omarchy-restic-pre-restore-<data>
@@ -140,12 +132,6 @@ Depois de revisar o plano, é possível executar sem perguntas:
 
 ```bash
 "$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-restore" --full --yes
-```
-
-Volumes Docker já existentes são preservados. A substituição explícita é destrutiva e exige:
-
-```bash
-"$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-restore" --full --replace-docker-volumes
 ```
 
 ## 4. Depois da restauração
@@ -171,8 +157,7 @@ Variáveis aceitas:
 
 - `RESTIC_REPOSITORY`: caminho do repositório;
 - `OMARCHY_RESTIC_MOUNT`: ponto de montagem do HD;
-- `OMARCHY_RESTIC_WORKDIR`: área temporária da restauração;
-- `OMARCHY_RESTIC_DOCKER_IMAGE`: imagem usada para arquivar/restaurar volumes Docker.
+- `OMARCHY_RESTIC_WORKDIR`: área temporária da restauração.
 
 ## Problemas comuns
 
@@ -189,6 +174,6 @@ lsblk -f
 findmnt
 ```
 
-### Volume Docker ignorado
+### Dados Docker
 
-O script registra volumes que não puderam ser arquivados no manifest. Verifique o daemon Docker, espaço livre e a mensagem exibida pelo backup antes de instalar o Omarchy.
+O conteúdo dos volumes Docker não é salvo. Os arquivos Compose, o inventário de containers e os nomes/configurações dos volumes são preservados para recriação do ambiente; bancos locais devem ser recriados ou exportados separadamente se forem necessários.
