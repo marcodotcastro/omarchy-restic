@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CURRENT_HOME="${HOME:?HOME não está definido}"
+CATALOG_PATH="${SCRIPT_DIR}/omarchy-restic-apps.conf"
+SNAPSHOT_ID="latest"
+WORKDIR=""
+YES=0
+KEEP_STAGE=0
+PHASE=""
+declare -a APP_IDS=()
+
+declare -A APP_NAME=()
+declare -A APP_COMMAND=()
+declare -A APP_PRESERVE_HOME=()
+declare -A APP_INSTALLATION_PATHS=()
+declare -A APP_LAUNCHER_PATHS=()
+declare -A APP_INSTALLER_PATH=()
+declare -A APP_RESTORE_MODE=()
+
+usage() {
+  cat <<'USAGE'
+Uso:
+  omarchy-restic-app-test <fase> [opções]
+
+Fases:
+  capture          captura exatamente três aplicativos em um snapshot de teste
+  verify-capture   restaura e verifica o snapshot sem alterar o HOME
+  assert-removed   confirma a remoção manual dos artefatos de instalação
+  restore          restaura somente os caminhos de usuário selecionados
+  validate         compara o estado restaurado com o manifest capturado
+
+Opções:
+  --app ID          aplicativo do catálogo; repetir três vezes em capture
+  --catalog PATH    catálogo; padrão: ./omarchy-restic-apps.conf
+  --snapshot ID     snapshot de teste; padrão: latest
+  --workdir PATH    diretório temporário existente e gravável
+  --yes             não pedir confirmação durante restore
+  --keep-stage      preservar a área temporária após sucesso
+  -h, --help        mostrar esta ajuda
+USAGE
+}
+
+if (($# == 0)); then
+  usage
+  exit 0
+fi
+
+case "$1" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+die() {
+  printf '[app-test][erro] %s\n' "$*" >&2
+  exit 1
+}
+
+catalog_load() {
+  local line
+  local -a fields
+  local id
+  local name
+  local command_name
+  local preserve_home
+  local installation_paths
+  local launcher_paths
+  local installer_path
+  local restore_mode
+
+  [[ -f "$CATALOG_PATH" ]] || die "catálogo não encontrado: $CATALOG_PATH"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    IFS='|' read -r -a fields <<<"$line"
+    ((${#fields[@]} == 8)) || die "linha inválida no catálogo (esperados 8 campos): $line"
+
+    id="${fields[0]}"
+    name="${fields[1]}"
+    command_name="${fields[2]}"
+    preserve_home="${fields[3]}"
+    installation_paths="${fields[4]}"
+    launcher_paths="${fields[5]}"
+    installer_path="${fields[6]}"
+    restore_mode="${fields[7]}"
+
+    [[ -n "$id" ]] || die 'ID vazio no catálogo'
+    [[ "$id" != *[[:space:]]* && "$id" != *'|'* ]] || die "ID inválido no catálogo: $id"
+    [[ -z "${APP_NAME[$id]+present}" ]] || die "ID duplicado no catálogo: $id"
+    [[ "$restore_mode" == home || "$restore_mode" == staged ]] || die "restore_mode inválido para $id: $restore_mode"
+
+    APP_NAME["$id"]="$name"
+    APP_COMMAND["$id"]="$command_name"
+    APP_PRESERVE_HOME["$id"]="$preserve_home"
+    APP_INSTALLATION_PATHS["$id"]="$installation_paths"
+    APP_LAUNCHER_PATHS["$id"]="$launcher_paths"
+    APP_INSTALLER_PATH["$id"]="$installer_path"
+    APP_RESTORE_MODE["$id"]="$restore_mode"
+  done <"$CATALOG_PATH"
+}
+
+catalog_require_app() {
+  local app_id="$1"
+
+  [[ -n "${APP_NAME[$app_id]+present}" ]] || die "aplicativo não encontrado no catálogo: $app_id"
+}
+
+expand_catalog_path() {
+  local path_pattern="$1"
+
+  case "$path_pattern" in
+    '\$HOME'/*)
+      printf '%s%s\n' "$CURRENT_HOME" "${path_pattern#'\$HOME'}"
+      ;;
+    '~/'*)
+      printf '%s/%s\n' "$CURRENT_HOME" "${path_pattern#'~/'}"
+      ;;
+    /*)
+      printf '%s\n' "$path_pattern"
+      ;;
+    *)
+      die "caminho do catálogo deve começar com \$HOME/, ~/, ou /: $path_pattern"
+      ;;
+  esac
+}
+
+validate_home_pattern() {
+  local path_pattern="$1"
+  local expanded
+
+  expanded="$(expand_catalog_path "$path_pattern")"
+  case "$expanded" in
+    "$CURRENT_HOME"|"$CURRENT_HOME"/*)
+      ;;
+    *)
+      die "caminho de preserve_home fora do HOME: $path_pattern"
+      ;;
+  esac
+
+  [[ "$expanded" != *'/../'* && "$expanded" != */.. ]] || die "caminho de preserve_home fora do HOME: $path_pattern"
+}
+
+validate_selected_apps() {
+  local app_id
+  local preserve_pattern
+
+  ((${#APP_IDS[@]} == 3)) || die 'capture exige exatamente três aplicativos'
+
+  for app_id in "${APP_IDS[@]}"; do
+    catalog_require_app "$app_id"
+  done
+
+  [[ "${APP_IDS[0]}" != "${APP_IDS[1]}" && "${APP_IDS[0]}" != "${APP_IDS[2]}" && "${APP_IDS[1]}" != "${APP_IDS[2]}" ]] || die 'IDs de aplicativos duplicados na seleção'
+
+  for app_id in "${APP_IDS[@]}"; do
+    while IFS= read -r preserve_pattern; do
+      [[ -n "$preserve_pattern" ]] || continue
+      validate_home_pattern "$preserve_pattern"
+    done < <(printf '%s\n' "${APP_PRESERVE_HOME[$app_id]}" | tr ';' '\n')
+  done
+}
+
+parse_arguments() {
+  PHASE="$1"
+  shift
+
+  while (($# > 0)); do
+    case "$1" in
+      --app)
+        shift
+        (($# > 0)) || die '--app precisa de um ID'
+        APP_IDS+=("$1")
+        ;;
+      --catalog)
+        shift
+        (($# > 0)) || die '--catalog precisa de um caminho'
+        CATALOG_PATH="$1"
+        ;;
+      --snapshot)
+        shift
+        (($# > 0)) || die '--snapshot precisa de um ID'
+        SNAPSHOT_ID="$1"
+        ;;
+      --workdir)
+        shift
+        (($# > 0)) || die '--workdir precisa de um caminho'
+        WORKDIR="$1"
+        ;;
+      --yes)
+        YES=1
+        ;;
+      --keep-stage)
+        KEEP_STAGE=1
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "opção desconhecida: $1 (use --help)"
+        ;;
+    esac
+    shift
+  done
+}
+
+[[ "$1" == capture || "$1" == verify-capture || "$1" == assert-removed || "$1" == restore || "$1" == validate ]] || die "fase desconhecida: $1"
+parse_arguments "$@"
+
+catalog_load
+if [[ "$PHASE" == capture ]]; then
+  validate_selected_apps
+  printf '[app-test] catálogo e seleção válidos\n'
+  exit 0
+fi
+
+printf '[app-test][erro] fase ainda não implementada: %s\n' "$PHASE" >&2
+exit 2
