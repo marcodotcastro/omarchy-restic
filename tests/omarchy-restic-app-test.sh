@@ -175,4 +175,37 @@ expect_failure_contains \
   run_app_test assert-removed --catalog "$catalog" --workdir "$WORKDIR"
 rm -f "$FIXTURE_HOME/.local/share/fixture-two/bin/fixture-two"
 
+printf 'arquivo fora do conjunto selecionado\n' >"$FIXTURE_HOME/unrelated.txt"
+printf 'sentinela anterior\n' >"$FIXTURE_HOME/.local/share/fixture-one/bin/fixture-one"
+chmod 700 "$FIXTURE_HOME/.local/share/fixture-one/bin/fixture-one"
+
+restore_output="$TEST_ROOT/restore.txt"
+set +e
+run_app_test restore --catalog "$catalog" --yes --workdir "$WORKDIR" >"$restore_output" 2>&1
+restore_status=$?
+set -e
+assert_status 0 "$restore_status" 'restore dos caminhos de usuário'
+assert_contains "$restore_output" 'PASS' 'restore informa sucesso'
+[[ -f "$FIXTURE_HOME/.config/fixture-one/settings.json" ]] || fail 'configuração do fixture-one não foi restaurada'
+[[ -x "$FIXTURE_HOME/.local/share/fixture-one/bin/fixture-one" ]] || fail 'executável do fixture-one não foi restaurado'
+[[ -f "$FIXTURE_HOME/.local/share/fixture-two/bin/fixture-two" ]] || fail 'executável do fixture-two não foi restaurado'
+[[ -f "$FIXTURE_HOME/.local/share/fixture-three/bin/fixture-three" ]] || fail 'executável do fixture-three não foi restaurado'
+[[ -f "$FIXTURE_HOME/unrelated.txt" ]] || fail 'arquivo não selecionado foi removido'
+pre_restore_dir="$(find "$FIXTURE_HOME" -maxdepth 1 -type d -name '.omarchy-restic-app-test-pre-restore-*' -print -quit)"
+[[ -n "$pre_restore_dir" ]] || fail 'diretório de segurança do restore não foi criado'
+
+validate_output="$TEST_ROOT/validate.txt"
+set +e
+run_app_test validate --catalog "$catalog" --workdir "$WORKDIR" >"$validate_output" 2>&1
+validate_status=$?
+set -e
+assert_status 0 "$validate_status" 'validate após restore'
+assert_contains "$validate_output" 'PASS' 'validate informa sucesso'
+
+printf '\nconteúdo alterado depois do restore\n' >>"$FIXTURE_HOME/.config/fixture-one/settings.json"
+expect_failure_contains \
+  'validate com hash alterado' \
+  'fixture-one' \
+  run_app_test validate --catalog "$catalog" --workdir "$WORKDIR"
+
 printf 'PASS: harness inicial\n'

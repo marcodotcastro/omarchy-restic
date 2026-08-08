@@ -491,6 +491,206 @@ assert_removed_phase() {
   log 'PASS: artefatos de instalação foram removidos manualmente'
 }
 
+ask_yes_no() {
+  local prompt="$1"
+  local answer
+
+  if (( YES == 1 )); then
+    return 0
+  fi
+
+  printf '%s [s/N] ' "$prompt" >&2
+  IFS= read -r answer || return 1
+  [[ "$answer" =~ ^[sS](i|I)?(m|M)?$ || "$answer" =~ ^[yY]$ ]]
+}
+
+assert_safe_destination() {
+  local destination="$1"
+  local cursor
+
+  case "$destination" in
+    "$CURRENT_HOME"|"$CURRENT_HOME"/*)
+      ;;
+    *)
+      die "destino de restore fora do HOME: $destination"
+      ;;
+  esac
+
+  cursor="$destination"
+  if [[ ! -d "$cursor" || -L "$cursor" ]]; then
+    cursor="${cursor%/*}"
+  fi
+  while [[ "$cursor" != "$CURRENT_HOME" && "$cursor" == "$CURRENT_HOME"/* ]]; do
+    [[ ! -L "$cursor" ]] || die "destino contém symlink e foi recusado por segurança: $cursor"
+    cursor="${cursor%/*}"
+  done
+}
+
+is_under_restored_root() {
+  local path="$1"
+  local root
+
+  for root in "${RESTORE_ROOTS[@]}"; do
+    [[ "$path" == "$root" || "$path" == "$root"/* ]] && return 0
+  done
+  return 1
+}
+
+restore_home_records() {
+  local source_home="$1"
+  local first_field
+  local app_field
+  local role_field
+  local scope_field
+  local type_field
+  local mode_field
+  local size_field
+  local checksum_field
+  local link_target_field
+  local path
+  local relative_path
+  local source_path
+  local destination_path
+  local destination_parent
+  local scope
+  local type
+  local key
+  local staged_count=0
+  declare -a RESTORE_ROOTS=()
+  declare -A RESTORE_PATH_SET=()
+
+  PRE_RESTORE_DIR="$CURRENT_HOME/.omarchy-restic-app-test-pre-restore-$(date '+%Y%m%d-%H%M%S')-$$"
+  mkdir -m 700 "$PRE_RESTORE_DIR"
+
+  while IFS=$'\t' read -r first_field app_field role_field scope_field type_field mode_field size_field checksum_field link_target_field; do
+    [[ "$first_field" == path=* ]] || continue
+    path="${first_field#path=}"
+    scope="${scope_field#scope=}"
+    type="${type_field#type=}"
+
+    if [[ "$scope" != home ]]; then
+      staged_count=$((staged_count + 1))
+      continue
+    fi
+
+    case "$path" in
+      "$source_home"/*)
+        relative_path="${path#"$source_home"/}"
+        ;;
+      *)
+        die "caminho de manifest não pertence ao source_home: $path"
+        ;;
+    esac
+
+    destination_path="$CURRENT_HOME/$relative_path"
+    key="$destination_path"
+    [[ -z "${RESTORE_PATH_SET[$key]+present}" ]] || continue
+    RESTORE_PATH_SET["$key"]=1
+    if is_under_restored_root "$path"; then
+      continue
+    fi
+
+    source_path="$STAGING_DIR/${path#/}"
+    [[ -e "$source_path" || -L "$source_path" ]] || die "origem do restore não encontrada: $source_path"
+    assert_safe_destination "$destination_path"
+
+    if [[ "$type" == directory ]]; then
+      rsync -a --backup --backup-dir="$PRE_RESTORE_DIR" "$source_path/" "$destination_path/"
+      RESTORE_ROOTS+=("$path")
+    else
+      destination_parent="${destination_path%/*}"
+      mkdir -p -- "$destination_parent"
+      rsync -a --backup --backup-dir="$PRE_RESTORE_DIR" "$source_path" "$destination_path"
+    fi
+  done <"$MANIFEST_PATH"
+
+  if (( staged_count > 0 )); then
+    log "STAGED ONLY: $staged_count registro(s) de sistema permanecem na área temporária"
+  fi
+}
+
+restore_phase() {
+  local source_home
+
+  [[ "$EUID" -ne 0 ]] || die 'execute como usuário normal, não como root'
+  command -v restic >/dev/null 2>&1 || die 'restic não está instalado'
+  command -v rsync >/dev/null 2>&1 || die 'rsync não está instalado'
+  command -v find >/dev/null 2>&1 || die 'find não está disponível'
+  [[ -d "$REPOSITORY" ]] || die "repositório não encontrado: $REPOSITORY"
+  load_password
+  trap cleanup EXIT
+  restore_snapshot_stage
+  source_home="$(manifest_value source_home)"
+
+  printf 'O restore copiará apenas caminhos de usuário dos três aplicativos.\n'
+  printf 'Arquivos sobrescritos serão preservados em .omarchy-restic-app-test-pre-restore-*.\n'
+  ask_yes_no 'Continuar com o restore dos aplicativos?' || die 'restore cancelado pelo usuário'
+  restore_home_records "$source_home"
+  log 'PASS: caminhos de usuário restaurados'
+}
+
+validate_live_phase() {
+  local source_home
+  local first_field
+  local app_field
+  local role_field
+  local scope_field
+  local type_field
+  local mode_field
+  local size_field
+  local checksum_field
+  local link_target_field
+  local path
+  local relative_path
+  local destination_path
+  local scope
+  local type
+  local staged_count=0
+
+  [[ "$EUID" -ne 0 ]] || die 'execute como usuário normal, não como root'
+  command -v restic >/dev/null 2>&1 || die 'restic não está instalado'
+  command -v sha256sum >/dev/null 2>&1 || die 'sha256sum não está disponível'
+  command -v stat >/dev/null 2>&1 || die 'stat não está disponível'
+  [[ -d "$REPOSITORY" ]] || die "repositório não encontrado: $REPOSITORY"
+  load_password
+  trap cleanup EXIT
+  restore_snapshot_stage
+  source_home="$(manifest_value source_home)"
+
+  while IFS=$'\t' read -r first_field app_field role_field scope_field type_field mode_field size_field checksum_field link_target_field; do
+    [[ "$first_field" == path=* ]] || continue
+    scope="${scope_field#scope=}"
+    if [[ "$scope" != home ]]; then
+      staged_count=$((staged_count + 1))
+      continue
+    fi
+
+    path="${first_field#path=}"
+    case "$path" in
+      "$source_home"/*)
+        relative_path="${path#"$source_home"/}"
+        ;;
+      *)
+        die "caminho de manifest não pertence ao source_home: $path"
+        ;;
+    esac
+    destination_path="$CURRENT_HOME/$relative_path"
+    type="${type_field#type=}"
+    check_manifest_record \
+      "$destination_path" \
+      "$type" \
+      "${mode_field#mode=}" \
+      "${size_field#size=}" \
+      "${checksum_field#sha256=}" \
+      "${link_target_field#link_target=}"
+  done <"$MANIFEST_PATH"
+
+  if (( staged_count > 0 )); then
+    log "STAGED ONLY: $staged_count registro(s) de sistema não foram validados no sistema ativo"
+  fi
+  log 'PASS: hashes, tipos e permissões dos caminhos de usuário conferem'
+}
+
 catalog_load() {
   local line
   local -a fields
@@ -657,6 +857,16 @@ fi
 
 if [[ "$PHASE" == assert-removed ]]; then
   assert_removed_phase
+  exit 0
+fi
+
+if [[ "$PHASE" == restore ]]; then
+  restore_phase
+  exit 0
+fi
+
+if [[ "$PHASE" == validate ]]; then
+  validate_live_phase
   exit 0
 fi
 
