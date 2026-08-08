@@ -208,4 +208,11 @@ expect_failure_contains \
   'fixture-one' \
   run_app_test validate --catalog "$catalog" --workdir "$WORKDIR"
 
+app_help="$TEST_ROOT/app-help.txt"
+"$ROOT_DIR/omarchy-restic-app-test" --help >"$app_help"
+assert_contains "$app_help" 'assert-removed' 'ajuda lista assert-removed'
+assert_contains "$ROOT_DIR/README.md" 'omarchy-restic-app-test capture' 'README documenta a captura de aplicativos'
+assert_contains "$ROOT_DIR/README.md" 'não remove aplicativos automaticamente' 'README documenta a remoção manual'
+assert_contains "$ROOT_DIR/README.md" 'STAGED ONLY' 'README documenta caminhos de sistema em staging'
+
 printf 'PASS: harness inicial\n'

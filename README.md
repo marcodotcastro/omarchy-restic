@@ -42,7 +42,7 @@ Clone este repositório ou use os scripts já copiados para o HD externo:
 ```bash
 git clone git@github.com:marcodotcastro/omarchy-restic.git "$HOME/omarchy-restic"
 cd "$HOME/omarchy-restic"
-chmod 700 omarchy-restic-backup omarchy-restic-restore omarchy-restic-verify
+chmod 700 omarchy-restic-backup omarchy-restic-restore omarchy-restic-verify omarchy-restic-app-test
 ```
 
 Para HTTPS, use:
@@ -104,7 +104,54 @@ export OMARCHY_RESTIC_VERIFY_WORKDIR="/caminho/com/espaco"
 ./omarchy-restic-verify
 ```
 
-## 3. Guardar os scripts fora do disco que será apagado
+## 3. Ensaiar remoção e restauração de aplicativos
+
+O script dedicado permite escolher exatamente três aplicativos do catálogo
+`omarchy-restic-apps.conf` e testar a sequência completa sem remover nada
+automaticamente:
+
+```bash
+export RESTIC_REPOSITORY="/media/$USER/Backup/omarchy-restic-v2"
+
+./omarchy-restic-app-test capture \
+  --app rubymine \
+  --app jetbrains-toolbox \
+  --app drawio
+./omarchy-restic-app-test verify-capture
+```
+
+Somente depois de `capture` e `verify-capture` terminarem com sucesso, feche e
+desinstale manualmente os três aplicativos. Em seguida, execute:
+
+```bash
+./omarchy-restic-app-test assert-removed
+./omarchy-restic-app-test restore
+./omarchy-restic-app-test validate
+```
+
+O teste não remove aplicativos automaticamente e não usa `--delete`. O
+`restore` copia apenas os caminhos de usuário definidos no catálogo e guarda
+arquivos sobrescritos em:
+
+```text
+~/.omarchy-restic-app-test-pre-restore-<data>-<pid>
+```
+
+RubyMine e Toolbox precisam estar instalados no momento do `capture` para que
+a remoção e a restauração do executável sejam realmente testadas. As pastas
+`~/.config/JetBrains/RubyMine*` comprovam o estado de configuração, mas não
+substituem um executável ausente.
+
+Entradas com instalação em `/opt` ou `/usr/share` aparecem como `STAGED ONLY`:
+os arquivos são verificados na área temporária, mas não são copiados com
+`sudo` automaticamente. O terceiro aplicativo pode ser trocado por qualquer
+ID existente no catálogo.
+
+O snapshot deste ensaio usa a tag `omarchy-app-test` e não substitui o
+snapshot principal `omarchy-migration`. O conteúdo dos volumes Docker
+continua fora de ambos os backups.
+
+## 4. Guardar os scripts fora do disco que será apagado
 
 Faça uma cópia dos scripts para o HD externo antes de instalar o Omarchy:
 
@@ -113,11 +160,13 @@ install -d -m 700 "$BACKUP_MOUNT/omarchy-migration-tools"
 install -m 700 omarchy-restic-backup "$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-backup"
 install -m 700 omarchy-restic-restore "$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-restore"
 install -m 700 omarchy-restic-verify "$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-verify"
+install -m 700 omarchy-restic-app-test "$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-app-test"
+install -m 644 omarchy-restic-apps.conf "$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-apps.conf"
 ```
 
 Na instalação do Omarchy, selecione somente o disco interno correto. Não formate o HD externo que contém `Backup`.
 
-## 4. Restaurar depois de instalar o Omarchy
+## 5. Restaurar depois de instalar o Omarchy
 
 Monte o HD externo. O caminho pode ser `/media/$USER/Backup` ou `/run/media/$USER/Backup`.
 
@@ -158,7 +207,7 @@ Depois de revisar o plano, é possível executar sem perguntas:
 "$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-restore" --full --yes
 ```
 
-## 5. Depois da restauração
+## 6. Depois da restauração
 
 O script restaura os projetos e seus lockfiles, mas não executa comandos arbitrários dentro dos projetos. Reinstale as dependências de cada projeto conforme necessário, por exemplo `bundle install` para Rails e `npm install` ou `pnpm install` para projetos Node.
 
@@ -176,6 +225,7 @@ omarchy-restic-backup --help
 omarchy-restic-restore --help
 omarchy-restic-restore --plan
 omarchy-restic-verify --help
+omarchy-restic-app-test --help
 ```
 
 Variáveis aceitas:
