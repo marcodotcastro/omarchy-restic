@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+CURRENT_USER="${USER:-$(id -un)}"
+CURRENT_HOME="${HOME:?HOME não está definido}"
+DEFAULT_MOUNT="/media/${CURRENT_USER}/Backup"
+DEFAULT_REPOSITORY="${DEFAULT_MOUNT}/omarchy-restic-v2"
+REPOSITORY="${OMARCHY_RESTIC_REPOSITORY:-${RESTIC_REPOSITORY:-${DEFAULT_REPOSITORY}}}"
+PASSWORD_FILE=""
+RESTORE_STAGE=""
+KEEP_RESTORE=0
+
+usage() {
+  cat <<'USAGE'
+Uso:
+  omarchy-restic-verify [opções]
+
+Valida o backup de migração em duas etapas:
+  1. confirma o snapshot mais recente com a tag omarchy-migration;
+  2. executa restic check --read-data;
+  3. restaura o snapshot inteiro em uma área temporária;
+  4. verifica a restauração com restic --verify e confere o manifest.
+
+O HOME atual nunca é alterado. A restauração temporária é criada no HD
+externo por padrão e removida ao final se tudo der certo.
+
+Opções:
+  --keep-restore  preserva a restauração temporária para inspeção manual
+  -h, --help      mostra esta ajuda
+
+Variáveis opcionais:
+  OMARCHY_RESTIC_REPOSITORY      caminho do repositório Restic
+  RESTIC_REPOSITORY              alternativa ao caminho acima
+  OMARCHY_RESTIC_MOUNT           ponto de montagem do HD externo
+  OMARCHY_RESTIC_VERIFY_WORKDIR  diretório para a restauração temporária
+  OMARCHY_RESTIC_WORKDIR         alternativa ao diretório acima
+
+Padrão do repositório:
+  /media/$USER/Backup/omarchy-restic-v2
+
+Exemplo:
+  omarchy-restic-backup
+  omarchy-restic-verify
+USAGE
+}
+
+log() {
+  printf '[verify] %s\n' "$*"
+}
+
+warn() {
+  printf '[verify][aviso] %s\n' "$*" >&2
+}
+
+die() {
+  printf '[verify][erro] %s\n' "$*" >&2
+  exit 1
+}
+
+cleanup() {
+  local status=$?
+
+  if [[ -n "$PASSWORD_FILE" ]]; then
+    rm -f -- "$PASSWORD_FILE"
+  fi
+
+  if [[ -n "$RESTORE_STAGE" && -d "$RESTORE_STAGE" ]]; then
+    if (( status == 0 && KEEP_RESTORE == 0 )); then
+      rm -rf -- "$RESTORE_STAGE"
+    else
+      warn "restauração temporária preservada para diagnóstico: $RESTORE_STAGE"
+    fi
+  fi
+
+  exit "$status"
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --keep-restore)
+      KEEP_RESTORE=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "opção desconhecida: $1 (use --help)"
+      ;;
+  esac
+  shift
+done
+
+[[ "$EUID" -ne 0 ]] || die "execute como usuário normal, não como root"
+[[ -d "$CURRENT_HOME" ]] || die "HOME não existe: $CURRENT_HOME"
+command -v restic >/dev/null 2>&1 || die "restic não está instalado"
+command -v mktemp >/dev/null 2>&1 || die "mktemp não está disponível"
+command -v awk >/dev/null 2>&1 || die "awk não está disponível"
+
+if [[ "$REPOSITORY" == /media/*/Backup/* || "$REPOSITORY" == /run/media/*/Backup/* ]]; then
+  if [[ -n "${OMARCHY_RESTIC_MOUNT:-}" ]]; then
+    BACKUP_MOUNT="$OMARCHY_RESTIC_MOUNT"
+  else
+    BACKUP_MOUNT="${REPOSITORY%%/Backup/*}/Backup"
+  fi
+  command -v mountpoint >/dev/null 2>&1 || die "mountpoint não está disponível para validar o HD externo"
+  mountpoint -q "$BACKUP_MOUNT" || die "HD externo não está montado em $BACKUP_MOUNT"
+else
+  BACKUP_MOUNT="${OMARCHY_RESTIC_MOUNT:-$(dirname "$(dirname "$REPOSITORY")")}"
+fi
+
+[[ -d "$REPOSITORY" ]] || die "repositório não encontrado: $REPOSITORY"
+
+if [[ -n "${OMARCHY_RESTIC_VERIFY_WORKDIR:-}" ]]; then
+  VERIFY_WORKDIR="$OMARCHY_RESTIC_VERIFY_WORKDIR"
+elif [[ -n "${OMARCHY_RESTIC_WORKDIR:-}" ]]; then
+  VERIFY_WORKDIR="$OMARCHY_RESTIC_WORKDIR"
+else
+  VERIFY_WORKDIR="$BACKUP_MOUNT"
+fi
+
+[[ -d "$VERIFY_WORKDIR" ]] || die "diretório da restauração temporária não existe: $VERIFY_WORKDIR"
+[[ -w "$VERIFY_WORKDIR" ]] || die "diretório da restauração temporária não permite escrita: $VERIFY_WORKDIR"
+
+PASSWORD_FILE="$(mktemp "${TMPDIR:-/tmp}/omarchy-restic-password.XXXXXX")"
+chmod 600 "$PASSWORD_FILE"
+trap cleanup EXIT
+
+printf 'Senha do repositório Restic: ' >&2
+IFS= read -r -s RESTIC_PASSWORD_INPUT || die "não foi possível ler a senha"
+printf '\n' >&2
+[[ -n "$RESTIC_PASSWORD_INPUT" ]] || die "a senha não pode ser vazia"
+printf '%s\n' "$RESTIC_PASSWORD_INPUT" >"$PASSWORD_FILE"
+unset RESTIC_PASSWORD_INPUT
+export RESTIC_PASSWORD_FILE="$PASSWORD_FILE"
+
+restic_cmd() {
+  restic -r "$REPOSITORY" "$@"
+}
+
+log "localizando o snapshot de migração mais recente"
+if ! SNAPSHOT_OUTPUT="$(restic_cmd snapshots --tag omarchy-migration --latest 1)"; then
+  die "não foi possível ler os snapshots do repositório"
+fi
+printf '%s\n' "$SNAPSHOT_OUTPUT"
+
+SNAPSHOT_ID="$(printf '%s\n' "$SNAPSHOT_OUTPUT" | awk '$1 ~ /^[[:xdigit:]]{8,}$/ && $2 ~ /^[0-9][0-9][0-9][0-9]-/ {print $1; exit}')"
+[[ -n "$SNAPSHOT_ID" ]] || die "nenhum snapshot com a tag omarchy-migration foi encontrado; execute o backup completo primeiro"
+log "snapshot selecionado: $SNAPSHOT_ID"
+
+log "executando restic check --read-data; esta etapa pode demorar"
+restic_cmd check --read-data
+
+RESTORE_STAGE="$(mktemp -d "$VERIFY_WORKDIR/.omarchy-restic-verify.XXXXXX")"
+chmod 700 "$RESTORE_STAGE"
+log "restaurando e verificando o snapshot em $RESTORE_STAGE"
+restic_cmd restore "$SNAPSHOT_ID" --target "$RESTORE_STAGE" --verify
+
+MANIFEST_PATH="$(find "$RESTORE_STAGE" -type f -name omarchy-restic-manifest.txt -print -quit 2>/dev/null || true)"
+[[ -n "$MANIFEST_PATH" && -f "$MANIFEST_PATH" ]] || die "manifest de migração não encontrado na restauração"
+
+SOURCE_HOME_ABSOLUTE="$(awk -F= '$1 == "source_home" {print substr($0, index($0, "=") + 1); exit}' "$MANIFEST_PATH")"
+[[ -n "$SOURCE_HOME_ABSOLUTE" && "$SOURCE_HOME_ABSOLUTE" == /* ]] || die "source_home inválido no manifest"
+SOURCE_HOME="$RESTORE_STAGE/${SOURCE_HOME_ABSOLUTE#/}"
+[[ -d "$SOURCE_HOME" ]] || die "HOME original não encontrado na restauração: $SOURCE_HOME_ABSOLUTE"
+
+if [[ -e "$CURRENT_HOME/RubymineProjects" ]]; then
+  [[ -d "$SOURCE_HOME/RubymineProjects" ]] || die "RubymineProjects não foi encontrado na restauração"
+  log "RubymineProjects encontrado na restauração"
+else
+  warn "RubymineProjects não existe no HOME atual; validação específica ignorada"
+fi
+
+log "manifest validado: $MANIFEST_PATH"
+log "BACKUP E RESTORE VALIDADOS COM SUCESSO"

@@ -42,7 +42,7 @@ Clone este repositório ou use os scripts já copiados para o HD externo:
 ```bash
 git clone git@github.com:marcodotcastro/omarchy-restic.git "$HOME/omarchy-restic"
 cd "$HOME/omarchy-restic"
-chmod 700 omarchy-restic-backup omarchy-restic-restore
+chmod 700 omarchy-restic-backup omarchy-restic-restore omarchy-restic-verify
 ```
 
 Para HTTPS, use:
@@ -81,7 +81,30 @@ restic snapshots --tag omarchy-migration --latest 1
 restic check
 ```
 
-## 2. Guardar os scripts fora do disco que será apagado
+## 2. Validar backup e restore antes de instalar
+
+Execute a validação completa antes de apagar o disco interno:
+
+```bash
+./omarchy-restic-verify
+```
+
+O script exige um snapshot com a tag `omarchy-migration`, executa `restic check --read-data` e restaura o snapshot inteiro para uma pasta temporária no HD externo usando `--verify`. Ele também confirma o manifest e, quando `RubymineProjects` existe no HOME atual, confirma que esse diretório foi restaurado. O `$HOME` atual nunca é alterado.
+
+Essa etapa pode demorar e precisa de espaço livre suficiente para uma cópia temporária do backup. A pasta temporária é removida automaticamente quando tudo passa; em caso de erro, o caminho é preservado para diagnóstico. Para mantê-la mesmo após sucesso:
+
+```bash
+./omarchy-restic-verify --keep-restore
+```
+
+Se quiser escolher outra área temporária já existente:
+
+```bash
+export OMARCHY_RESTIC_VERIFY_WORKDIR="/caminho/com/espaco"
+./omarchy-restic-verify
+```
+
+## 3. Guardar os scripts fora do disco que será apagado
 
 Faça uma cópia dos scripts para o HD externo antes de instalar o Omarchy:
 
@@ -89,11 +112,12 @@ Faça uma cópia dos scripts para o HD externo antes de instalar o Omarchy:
 install -d -m 700 "$BACKUP_MOUNT/omarchy-migration-tools"
 install -m 700 omarchy-restic-backup "$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-backup"
 install -m 700 omarchy-restic-restore "$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-restore"
+install -m 700 omarchy-restic-verify "$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-verify"
 ```
 
 Na instalação do Omarchy, selecione somente o disco interno correto. Não formate o HD externo que contém `Backup`.
 
-## 3. Restaurar depois de instalar o Omarchy
+## 4. Restaurar depois de instalar o Omarchy
 
 Monte o HD externo. O caminho pode ser `/media/$USER/Backup` ou `/run/media/$USER/Backup`.
 
@@ -134,7 +158,7 @@ Depois de revisar o plano, é possível executar sem perguntas:
 "$BACKUP_MOUNT/omarchy-migration-tools/omarchy-restic-restore" --full --yes
 ```
 
-## 4. Depois da restauração
+## 5. Depois da restauração
 
 O script restaura os projetos e seus lockfiles, mas não executa comandos arbitrários dentro dos projetos. Reinstale as dependências de cada projeto conforme necessário, por exemplo `bundle install` para Rails e `npm install` ou `pnpm install` para projetos Node.
 
@@ -151,13 +175,15 @@ restic snapshots --tag omarchy-migration --latest 1
 omarchy-restic-backup --help
 omarchy-restic-restore --help
 omarchy-restic-restore --plan
+omarchy-restic-verify --help
 ```
 
 Variáveis aceitas:
 
 - `RESTIC_REPOSITORY`: caminho do repositório;
 - `OMARCHY_RESTIC_MOUNT`: ponto de montagem do HD;
-- `OMARCHY_RESTIC_WORKDIR`: área temporária da restauração.
+- `OMARCHY_RESTIC_WORKDIR`: área temporária da restauração;
+- `OMARCHY_RESTIC_VERIFY_WORKDIR`: área temporária específica da validação completa.
 
 ## Problemas comuns
 
