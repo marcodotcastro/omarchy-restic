@@ -86,4 +86,63 @@ expect_failure_contains \
   'fora do HOME' \
   bash "$ROOT_DIR/omarchy-restic-app-test" capture --catalog "$outside_catalog" --app fixture-one --app fixture-two --app fixture-three
 
+PASSWORD_FILE="$TEST_ROOT/password"
+REPOSITORY="$TEST_ROOT/repository"
+FIXTURE_HOME="$TEST_ROOT/home"
+RESTIC_CACHE_DIR="$TEST_ROOT/restic-cache"
+WORKDIR="$TEST_ROOT/workdir"
+mkdir -m 700 -p "$FIXTURE_HOME" "$WORKDIR" "$RESTIC_CACHE_DIR"
+printf 'test-password\n' >"$PASSWORD_FILE"
+chmod 600 "$PASSWORD_FILE"
+
+create_fixture() {
+  local app_id="$1"
+
+  mkdir -p \
+    "$FIXTURE_HOME/.config/$app_id" \
+    "$FIXTURE_HOME/.local/share/$app_id/bin" \
+    "$FIXTURE_HOME/.local/share/applications"
+  printf '{"app":"%s","recent":"project-%s"}\n' "$app_id" "$app_id" >"$FIXTURE_HOME/.config/$app_id/settings.json"
+  printf '#!/usr/bin/env bash\nprintf "fixture-%s\\n"\n' "$app_id" >"$FIXTURE_HOME/.local/share/$app_id/bin/$app_id"
+  chmod 700 "$FIXTURE_HOME/.local/share/$app_id/bin/$app_id"
+  printf '[Desktop Entry]\nName=%s\nType=Application\nExec=%s\n' "$app_id" "$FIXTURE_HOME/.local/share/$app_id/bin/$app_id" >"$FIXTURE_HOME/.local/share/applications/$app_id.desktop"
+}
+
+create_fixture fixture-one
+create_fixture fixture-two
+create_fixture fixture-three
+RESTIC_PASSWORD_FILE="$PASSWORD_FILE" RESTIC_CACHE_DIR="$RESTIC_CACHE_DIR" restic -r "$REPOSITORY" init >/dev/null
+
+run_app_test() {
+  HOME="$FIXTURE_HOME" \
+    USER="${USER:-$(id -un)}" \
+    RESTIC_REPOSITORY="$REPOSITORY" \
+    RESTIC_PASSWORD_FILE="$PASSWORD_FILE" \
+    OMARCHY_RESTIC_PASSWORD_FILE="$PASSWORD_FILE" \
+    RESTIC_CACHE_DIR="$RESTIC_CACHE_DIR" \
+    "$ROOT_DIR/omarchy-restic-app-test" "$@"
+}
+
+capture_output="$TEST_ROOT/capture.txt"
+set +e
+run_app_test capture --catalog "$catalog" --app fixture-one --app fixture-two --app fixture-three --workdir "$WORKDIR" >"$capture_output" 2>&1
+capture_status=$?
+set -e
+assert_status 0 "$capture_status" 'capture do snapshot de teste'
+assert_contains "$capture_output" 'omarchy-app-test' 'capture informa a tag do snapshot'
+
+snapshot_output="$(RESTIC_PASSWORD_FILE="$PASSWORD_FILE" RESTIC_CACHE_DIR="$RESTIC_CACHE_DIR" restic -r "$REPOSITORY" snapshots --tag omarchy-app-test --latest 1)"
+grep -Fq 'omarchy-app-test' <<<"$snapshot_output" || fail 'snapshot de teste não encontrado'
+
+manifest_stage="$TEST_ROOT/manifest-stage"
+mkdir -m 700 "$manifest_stage"
+RESTIC_PASSWORD_FILE="$PASSWORD_FILE" RESTIC_CACHE_DIR="$RESTIC_CACHE_DIR" restic -r "$REPOSITORY" restore latest --tag omarchy-app-test --target "$manifest_stage" --verify >/dev/null
+manifest_path="$(find "$manifest_stage" -type f -name omarchy-app-test-manifest.txt -print -quit)"
+[[ -n "$manifest_path" ]] || fail 'manifest de teste não encontrado no snapshot'
+assert_contains "$manifest_path" 'format=omarchy-app-test-v1' 'manifest informa o formato'
+assert_contains "$manifest_path" 'app.1.id=fixture-one' 'manifest contém fixture-one'
+assert_contains "$manifest_path" 'app.2.id=fixture-two' 'manifest contém fixture-two'
+assert_contains "$manifest_path" 'app.3.id=fixture-three' 'manifest contém fixture-three'
+assert_contains "$manifest_path" $'\tsha256=' 'manifest contém SHA-256'
+
 printf 'PASS: harness inicial\n'

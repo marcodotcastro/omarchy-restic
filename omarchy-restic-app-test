@@ -3,13 +3,26 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CURRENT_USER="${USER:-$(id -un)}"
 CURRENT_HOME="${HOME:?HOME não está definido}"
+DEFAULT_MOUNT="/media/${CURRENT_USER}/Backup"
+DEFAULT_REPOSITORY="${DEFAULT_MOUNT}/omarchy-restic-v2"
+REPOSITORY="${OMARCHY_RESTIC_REPOSITORY:-${RESTIC_REPOSITORY:-${DEFAULT_REPOSITORY}}}"
+APP_TEST_TAG="omarchy-app-test"
 CATALOG_PATH="${SCRIPT_DIR}/omarchy-restic-apps.conf"
 SNAPSHOT_ID="latest"
 WORKDIR=""
 YES=0
 KEEP_STAGE=0
 PHASE=""
+PASSWORD_FILE=""
+TEMP_PASSWORD_FILE=""
+STAGING_DIR=""
+MANIFEST_PATH=""
+EXCLUDE_FILE=""
+declare -a BACKUP_PATHS=()
+declare -A BACKUP_PATH_SET=()
+declare -A MANIFEST_PATH_SET=()
 declare -a APP_IDS=()
 
 declare -A APP_NAME=()
@@ -58,6 +71,254 @@ esac
 die() {
   printf '[app-test][erro] %s\n' "$*" >&2
   exit 1
+}
+
+log() {
+  printf '[app-test] %s\n' "$*"
+}
+
+cleanup() {
+  local status=$?
+
+  if [[ -n "$TEMP_PASSWORD_FILE" && -f "$TEMP_PASSWORD_FILE" ]]; then
+    rm -f -- "$TEMP_PASSWORD_FILE"
+  fi
+
+  if [[ -n "$STAGING_DIR" && -d "$STAGING_DIR" ]]; then
+    if (( status == 0 && KEEP_STAGE == 0 )); then
+      rm -rf -- "$STAGING_DIR"
+    else
+      printf '[app-test][aviso] staging preservado para diagnóstico: %s\n' "$STAGING_DIR" >&2
+    fi
+  fi
+
+  exit "$status"
+}
+
+restic_cmd() {
+  restic -r "$REPOSITORY" "$@"
+}
+
+load_password() {
+  if [[ -n "${OMARCHY_RESTIC_PASSWORD_FILE:-}" ]]; then
+    [[ -r "$OMARCHY_RESTIC_PASSWORD_FILE" ]] || die "arquivo de senha não pode ser lido: $OMARCHY_RESTIC_PASSWORD_FILE"
+    PASSWORD_FILE="$OMARCHY_RESTIC_PASSWORD_FILE"
+  elif [[ -n "${RESTIC_PASSWORD_FILE:-}" ]]; then
+    [[ -r "$RESTIC_PASSWORD_FILE" ]] || die "RESTIC_PASSWORD_FILE não pode ser lido: $RESTIC_PASSWORD_FILE"
+    PASSWORD_FILE="$RESTIC_PASSWORD_FILE"
+  else
+    TEMP_PASSWORD_FILE="$(mktemp "${TMPDIR:-/tmp}/omarchy-restic-app-test-password.XXXXXX")"
+    chmod 600 "$TEMP_PASSWORD_FILE"
+    printf 'Senha do repositório Restic: ' >&2
+    IFS= read -r -s RESTIC_PASSWORD_INPUT || die 'não foi possível ler a senha'
+    printf '\n' >&2
+    [[ -n "$RESTIC_PASSWORD_INPUT" ]] || die 'a senha não pode ser vazia'
+    printf '%s\n' "$RESTIC_PASSWORD_INPUT" >"$TEMP_PASSWORD_FILE"
+    unset RESTIC_PASSWORD_INPUT
+    PASSWORD_FILE="$TEMP_PASSWORD_FILE"
+  fi
+
+  export RESTIC_PASSWORD_FILE="$PASSWORD_FILE"
+}
+
+path_is_inside_home() {
+  local path="$1"
+
+  [[ "$path" == "$CURRENT_HOME" || "$path" == "$CURRENT_HOME"/* ]]
+}
+
+collect_pattern_matches() {
+  local path_pattern="$1"
+  local expanded
+  local -a matches=()
+  local -a glob_matches=()
+
+  expanded="$(expand_catalog_path "$path_pattern")"
+  if [[ -e "$expanded" || -L "$expanded" ]]; then
+    matches+=("$expanded")
+  fi
+
+  mapfile -t glob_matches < <(compgen -G "$expanded" || true)
+  matches+=("${glob_matches[@]}")
+
+  if ((${#matches[@]} > 0)); then
+    printf '%s\n' "${matches[@]}" | sort -u
+  fi
+}
+
+add_backup_path() {
+  local path="$1"
+
+  [[ -e "$path" || -L "$path" ]] || die "caminho não existe no momento da captura: $path"
+  if [[ -z "${BACKUP_PATH_SET[$path]+present}" ]]; then
+    BACKUP_PATH_SET["$path"]=1
+    BACKUP_PATHS+=("$path")
+  fi
+}
+
+file_metadata() {
+  local path="$1"
+  local type
+  local mode
+  local size
+  local checksum='-'
+  local link_target='-'
+
+  [[ "$path" != *$'\t'* && "$path" != *$'\n'* ]] || die "caminho contém tab ou quebra de linha e não pode entrar no manifest: $path"
+
+  if [[ -L "$path" ]]; then
+    type='symlink'
+    link_target="$(readlink -- "$path")"
+  elif [[ -f "$path" ]]; then
+    type='file'
+    checksum="$(sha256sum -- "$path" | awk '{print $1}')"
+  elif [[ -d "$path" ]]; then
+    type='directory'
+  else
+    die "tipo de arquivo não suportado na captura: $path"
+  fi
+
+  mode="$(stat -c '%a' -- "$path")"
+  size="$(stat -c '%s' -- "$path")"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$type" "$mode" "$size" "$checksum" "$link_target" "$path" "$CURRENT_HOME" "$PHASE"
+}
+
+record_tree() {
+  local app_id="$1"
+  local role="$2"
+  local root_path="$3"
+  local path
+  local scope
+  local metadata
+  local type
+  local mode
+  local size
+  local checksum
+  local link_target
+  local recorded_path
+
+  while IFS= read -r -d '' path; do
+    [[ -z "${MANIFEST_PATH_SET[$path]+present}" ]] || continue
+    MANIFEST_PATH_SET["$path"]=1
+
+    if path_is_inside_home "$path"; then
+      scope='home'
+    else
+      scope='system'
+    fi
+
+    metadata="$(file_metadata "$path")"
+    IFS=$'\t' read -r type mode size checksum link_target recorded_path _ _ <<<"$metadata"
+    printf 'path=%s\tapp=%s\trole=%s\tscope=%s\ttype=%s\tmode=%s\tsize=%s\tsha256=%s\tlink_target=%s\n' \
+      "$recorded_path" "$app_id" "$role" "$scope" "$type" "$mode" "$size" "$checksum" "$link_target" >>"$MANIFEST_PATH"
+  done < <(find -P "$root_path" -print0)
+}
+
+record_catalog_paths() {
+  local app_id="$1"
+  local field_name="$2"
+  local role="$3"
+  local require_match="$4"
+  local path_pattern
+  local path
+  local -a patterns=()
+  local -a matches=()
+
+  IFS=';' read -r -a patterns <<<"$field_name"
+  for path_pattern in "${patterns[@]}"; do
+    [[ -n "$path_pattern" && "$path_pattern" != none ]] || continue
+    [[ "$role" != preserve || "$path_pattern" == \$HOME/* || "$path_pattern" == '~/'* ]] || die "caminho de preserve_home fora do HOME: $path_pattern"
+    [[ "$role" != preserve ]] || validate_home_pattern "$path_pattern"
+    mapfile -t matches < <(collect_pattern_matches "$path_pattern")
+    if (( require_match == 1 && ${#matches[@]} == 0 )); then
+      die "caminho necessário não encontrado para $app_id: $path_pattern"
+    fi
+    for path in "${matches[@]}"; do
+      add_backup_path "$path"
+      record_tree "$app_id" "$role" "$path"
+    done
+  done
+}
+
+capture_phase() {
+  local app_id
+  local index=0
+
+  [[ "$EUID" -ne 0 ]] || die 'execute como usuário normal, não como root'
+  command -v restic >/dev/null 2>&1 || die 'restic não está instalado'
+  command -v awk >/dev/null 2>&1 || die 'awk não está disponível'
+  command -v find >/dev/null 2>&1 || die 'find não está disponível'
+  command -v sha256sum >/dev/null 2>&1 || die 'sha256sum não está disponível'
+  command -v stat >/dev/null 2>&1 || die 'stat não está disponível'
+  [[ -d "$REPOSITORY" ]] || die "repositório não encontrado: $REPOSITORY"
+
+  if [[ -n "$WORKDIR" ]]; then
+    [[ -d "$WORKDIR" && -w "$WORKDIR" ]] || die "workdir não existe ou não permite escrita: $WORKDIR"
+  else
+    WORKDIR="${OMARCHY_RESTIC_WORKDIR:-${TMPDIR:-/tmp}}"
+    [[ -d "$WORKDIR" && -w "$WORKDIR" ]] || die "workdir não existe ou não permite escrita: $WORKDIR"
+  fi
+
+  load_password
+  trap cleanup EXIT
+  restic_cmd cat config >/dev/null
+
+  STAGING_DIR="$(mktemp -d "$WORKDIR/.omarchy-restic-app-capture.XXXXXX")"
+  chmod 700 "$STAGING_DIR"
+  MANIFEST_PATH="$STAGING_DIR/omarchy-app-test-manifest.txt"
+  EXCLUDE_FILE="$STAGING_DIR/restic-excludes.txt"
+  : >"$MANIFEST_PATH"
+
+  {
+    printf 'format=omarchy-app-test-v1\n'
+    printf 'created_at=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    printf 'source_home=%s\n' "$CURRENT_HOME"
+    printf 'app_count=%s\n' "${#APP_IDS[@]}"
+  } >"$MANIFEST_PATH"
+
+  for app_id in "${APP_IDS[@]}"; do
+    index=$((index + 1))
+    printf 'app.%s.id=%s\n' "$index" "$app_id" >>"$MANIFEST_PATH"
+    printf 'app.%s.name=%s\n' "$index" "${APP_NAME[$app_id]}" >>"$MANIFEST_PATH"
+    printf 'app.%s.restore_mode=%s\n' "$index" "${APP_RESTORE_MODE[$app_id]}" >>"$MANIFEST_PATH"
+    printf 'app.%s.command=%s\n' "$index" "${APP_COMMAND[$app_id]}" >>"$MANIFEST_PATH"
+
+    if [[ -n "${APP_COMMAND[$app_id]}" ]] && command -v pgrep >/dev/null 2>&1; then
+      if pgrep -u "$CURRENT_USER" -x "${APP_COMMAND[$app_id]}" >/dev/null 2>&1; then
+        die "feche o aplicativo antes da captura: $app_id"
+      fi
+    fi
+
+    record_catalog_paths "$app_id" "${APP_PRESERVE_HOME[$app_id]}" preserve 1
+    record_catalog_paths "$app_id" "${APP_INSTALLATION_PATHS[$app_id]}" installation 1
+    record_catalog_paths "$app_id" "${APP_LAUNCHER_PATHS[$app_id]}" launcher 0
+    if [[ -n "${APP_INSTALLER_PATH[$app_id]}" && "${APP_INSTALLER_PATH[$app_id]}" != none ]]; then
+      record_catalog_paths "$app_id" "${APP_INSTALLER_PATH[$app_id]}" installer 1
+    fi
+  done
+
+  {
+    printf '%s\n' "$CURRENT_HOME/.cache"
+    printf '%s\n' "$CURRENT_HOME/.local/share/Trash"
+    printf '%s/**/node_modules\n' "$CURRENT_HOME"
+    printf '%s/**/vendor/bundle\n' "$CURRENT_HOME"
+    printf '%s/**/.bundle\n' "$CURRENT_HOME"
+    printf '%s/**/tmp\n' "$CURRENT_HOME"
+    printf '%s/**/log\n' "$CURRENT_HOME"
+    printf '%s/**/coverage\n' "$CURRENT_HOME"
+    printf '%s/**/.terraform\n' "$CURRENT_HOME"
+  } >"$EXCLUDE_FILE"
+
+  log "criando snapshot com a tag $APP_TEST_TAG"
+  restic_cmd backup \
+    --one-file-system \
+    --exclude-file "$EXCLUDE_FILE" \
+    --tag "$APP_TEST_TAG" \
+    "${BACKUP_PATHS[@]}" \
+    "$STAGING_DIR"
+
+  log 'snapshot de teste criado; listando o snapshot mais recente'
+  restic_cmd snapshots --tag "$APP_TEST_TAG" --latest 1
 }
 
 catalog_load() {
@@ -114,8 +375,8 @@ expand_catalog_path() {
   local path_pattern="$1"
 
   case "$path_pattern" in
-    '\$HOME'/*)
-      printf '%s%s\n' "$CURRENT_HOME" "${path_pattern#'\$HOME'}"
+    \$HOME/*)
+      printf '%s%s\n' "$CURRENT_HOME" "${path_pattern#\$HOME}"
       ;;
     '~/'*)
       printf '%s/%s\n' "$CURRENT_HOME" "${path_pattern#'~/'}"
@@ -215,7 +476,7 @@ parse_arguments "$@"
 catalog_load
 if [[ "$PHASE" == capture ]]; then
   validate_selected_apps
-  printf '[app-test] catálogo e seleção válidos\n'
+  capture_phase
   exit 0
 fi
 
