@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+CURRENT_USER="${USER:-$(id -un)}"
+CURRENT_HOME="${HOME:?HOME não está definido}"
+DEFAULT_MOUNT="/media/${CURRENT_USER}/Backup"
+DEFAULT_REPOSITORY="${DEFAULT_MOUNT}/omarchy-restic-v2"
+REPOSITORY="${OMARCHY_RESTIC_REPOSITORY:-${RESTIC_REPOSITORY:-${DEFAULT_REPOSITORY}}}"
+DOCKER_ARCHIVE_IMAGE="${OMARCHY_RESTIC_DOCKER_IMAGE:-busybox:1.36}"
+SKIP_DOCKER_VOLUMES=0
+PASSWORD_FILE=""
+STAGING_DIR=""
+
+usage() {
+  cat <<'USAGE'
+Uso:
+  omarchy-restic-backup [opções]
+
+Cria um snapshot Restic criptografado com o conteúdo importante da migração:
+  - todo o HOME, exceto caches e artefatos regeneráveis;
+  - projetos, worktrees, documentos, Obsidian e configurações;
+  - inventário de pacotes e ferramentas;
+  - metadados Docker e arquivos dos volumes nomeados, quando possível.
+
+Opções:
+  --no-docker-volumes  não arquiva o conteúdo dos volumes Docker
+  -h, --help           mostra esta ajuda
+
+Variáveis opcionais:
+  OMARCHY_RESTIC_REPOSITORY  caminho do repositório Restic
+  RESTIC_REPOSITORY          alternativa ao caminho acima
+  OMARCHY_RESTIC_MOUNT       ponto de montagem do HD externo
+  OMARCHY_RESTIC_DOCKER_IMAGE imagem usada para arquivar volumes
+
+Padrão do repositório:
+  /media/$USER/Backup/omarchy-restic-v2
+USAGE
+}
+
+log() {
+  printf '[backup] %s\n' "$*"
+}
+
+warn() {
+  printf '[backup][aviso] %s\n' "$*" >&2
+}
+
+die() {
+  printf '[backup][erro] %s\n' "$*" >&2
+  exit 1
+}
+
+record_command() {
+  local output_file="$1"
+  shift
+  mkdir -p "$(dirname "$output_file")"
+  {
+    printf 'command:'
+    printf ' %q' "$@"
+    printf '\n'
+    if command -v "$1" >/dev/null 2>&1; then
+      "$@" || printf '\nexit_status: %s\n' "$?"
+    else
+      printf 'not_installed: %s\n' "$1"
+    fi
+  } >"$output_file" 2>&1
+}
+
+cleanup() {
+  local status=$?
+
+  if [[ -n "$PASSWORD_FILE" ]]; then
+    rm -f -- "$PASSWORD_FILE"
+  fi
+
+  if [[ -n "$STAGING_DIR" && -d "$STAGING_DIR" ]]; then
+    if (( status == 0 )); then
+      rm -rf -- "$STAGING_DIR"
+    else
+      warn "staging preservado para diagnóstico: $STAGING_DIR"
+    fi
+  fi
+
+  exit "$status"
+}
+
+for argument in "$@"; do
+  case "$argument" in
+    --no-docker-volumes)
+      SKIP_DOCKER_VOLUMES=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "opção desconhecida: $argument (use --help)"
+      ;;
+  esac
+done
+
+[[ "$EUID" -ne 0 ]] || die "execute como usuário normal, não como root"
+[[ -d "$CURRENT_HOME" ]] || die "HOME não existe: $CURRENT_HOME"
+command -v restic >/dev/null 2>&1 || die "restic não está instalado"
+command -v mktemp >/dev/null 2>&1 || die "mktemp não está disponível"
+
+if [[ "$REPOSITORY" == /media/*/Backup/* ]]; then
+  BACKUP_MOUNT="${OMARCHY_RESTIC_MOUNT:-$DEFAULT_MOUNT}"
+  command -v mountpoint >/dev/null 2>&1 || die "mountpoint não está disponível para validar o HD externo"
+  mountpoint -q "$BACKUP_MOUNT" || die "HD externo não está montado em $BACKUP_MOUNT"
+else
+  BACKUP_MOUNT="${OMARCHY_RESTIC_MOUNT:-$(dirname "$(dirname "$REPOSITORY")")}" 
+fi
+
+[[ -d "$REPOSITORY" ]] || die "repositório não encontrado: $REPOSITORY"
+
+PASSWORD_FILE="$(mktemp "${TMPDIR:-/tmp}/omarchy-restic-password.XXXXXX")"
+chmod 600 "$PASSWORD_FILE"
+trap cleanup EXIT
+
+printf 'Senha do repositório Restic: ' >&2
+IFS= read -r -s RESTIC_PASSWORD_INPUT || die "não foi possível ler a senha"
+printf '\n' >&2
+[[ -n "$RESTIC_PASSWORD_INPUT" ]] || die "a senha não pode ser vazia"
+printf '%s\n' "$RESTIC_PASSWORD_INPUT" >"$PASSWORD_FILE"
+unset RESTIC_PASSWORD_INPUT
+export RESTIC_PASSWORD_FILE="$PASSWORD_FILE"
+
+restic_cmd() {
+  restic -r "$REPOSITORY" "$@"
+}
+
+log "validando o repositório: $REPOSITORY"
+restic_cmd snapshots --latest 1 >/dev/null
+
+STAGING_DIR="$(mktemp -d "$BACKUP_MOUNT/.omarchy-restic-staging.XXXXXX")"
+chmod 700 "$STAGING_DIR"
+MANIFEST_DIR="$STAGING_DIR/manifest"
+DOCKER_DIR="$STAGING_DIR/docker"
+DOCKER_VOLUME_DIR="$DOCKER_DIR/volumes"
+mkdir -p "$MANIFEST_DIR/tools" "$MANIFEST_DIR/packages" "$MANIFEST_DIR/git" "$DOCKER_VOLUME_DIR"
+
+log "coletando inventário de pacotes e ferramentas"
+if command -v apt-mark >/dev/null 2>&1; then
+  apt-mark showmanual >"$MANIFEST_DIR/packages/apt-manual.txt" || true
+else
+  printf 'apt-mark não disponível\n' >"$MANIFEST_DIR/packages/apt-manual.txt"
+fi
+
+if command -v dpkg-query >/dev/null 2>&1; then
+  dpkg-query -W -f='${binary:Package}\t${Version}\n' >"$MANIFEST_DIR/packages/dpkg.txt" || true
+else
+  printf 'dpkg-query não disponível\n' >"$MANIFEST_DIR/packages/dpkg.txt"
+fi
+
+if command -v flatpak >/dev/null 2>&1; then
+  flatpak list --app --columns=application,version,origin >"$MANIFEST_DIR/packages/flatpak.txt" || true
+  flatpak list --app --columns=application >"$MANIFEST_DIR/packages/flatpak-application-ids.txt" || true
+else
+  printf 'flatpak não disponível\n' >"$MANIFEST_DIR/packages/flatpak.txt"
+  : >"$MANIFEST_DIR/packages/flatpak-application-ids.txt"
+fi
+
+if command -v snap >/dev/null 2>&1; then
+  snap list >"$MANIFEST_DIR/packages/snap.txt" || true
+else
+  printf 'snap não disponível\n' >"$MANIFEST_DIR/packages/snap.txt"
+fi
+
+record_command "$MANIFEST_DIR/tools/git.txt" git --version
+record_command "$MANIFEST_DIR/tools/ruby.txt" ruby --version
+record_command "$MANIFEST_DIR/tools/rails.txt" rails --version
+record_command "$MANIFEST_DIR/tools/bundle.txt" bundle --version
+record_command "$MANIFEST_DIR/tools/rake.txt" rake --version
+record_command "$MANIFEST_DIR/tools/rspec.txt" rspec --version
+record_command "$MANIFEST_DIR/tools/node.txt" node --version
+record_command "$MANIFEST_DIR/tools/npm.txt" npm --version
+record_command "$MANIFEST_DIR/tools/pnpm.txt" pnpm --version
+record_command "$MANIFEST_DIR/tools/yarn.txt" yarn --version
+record_command "$MANIFEST_DIR/tools/docker.txt" docker --version
+record_command "$MANIFEST_DIR/tools/docker-compose.txt" docker compose version
+record_command "$MANIFEST_DIR/tools/restic.txt" restic version
+record_command "$MANIFEST_DIR/tools/gh.txt" gh --version
+record_command "$MANIFEST_DIR/tools/psql.txt" psql --version
+record_command "$MANIFEST_DIR/tools/rvm.txt" rvm --version
+record_command "$MANIFEST_DIR/tools/mise.txt" mise --version
+
+record_command "$MANIFEST_DIR/tools/ruby-gems.txt" gem list --local
+record_command "$MANIFEST_DIR/tools/npm-global.txt" npm list --global --depth=0
+record_command "$MANIFEST_DIR/tools/rvm-rubies.txt" rvm list
+record_command "$MANIFEST_DIR/tools/mise-tools.txt" mise list
+
+if [[ -d "$CURRENT_HOME/RubymineProjects" ]]; then
+  {
+    printf 'generated_at=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    while IFS= read -r -d '' git_marker; do
+      repository_root="${git_marker%/.git}"
+      printf '\n===== %s =====\n' "$repository_root"
+      git -C "$repository_root" status --short --branch 2>&1 || true
+      git -C "$repository_root" worktree list --porcelain 2>&1 || true
+    done < <(find "$CURRENT_HOME/RubymineProjects" \( -type d -o -type f \) -name .git -print0 2>/dev/null)
+  } >"$MANIFEST_DIR/git/rubymine-projects-status.txt"
+else
+  printf 'diretório não encontrado: %s\n' "$CURRENT_HOME/RubymineProjects" >"$MANIFEST_DIR/git/rubymine-projects-status.txt"
+fi
+
+DOCKER_AVAILABLE=0
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  DOCKER_AVAILABLE=1
+  log "coletando inventário Docker"
+  docker context ls >"$MANIFEST_DIR/docker-contexts.txt" || true
+  docker ps -a --no-trunc >"$MANIFEST_DIR/docker-containers.txt" || true
+  docker images --digests >"$MANIFEST_DIR/docker-images.txt" || true
+  docker volume ls >"$MANIFEST_DIR/docker-volumes.txt" || true
+  docker network ls >"$MANIFEST_DIR/docker-networks.txt" || true
+  docker compose ls --all >"$MANIFEST_DIR/docker-compose-projects.txt" || true
+  docker system df >"$MANIFEST_DIR/docker-disk-usage.txt" || true
+
+  mapfile -t container_ids < <(docker ps -aq)
+  if ((${#container_ids[@]} > 0)); then
+    docker inspect "${container_ids[@]}" >"$MANIFEST_DIR/docker-containers.json" || true
+  else
+    printf 'nenhum container\n' >"$MANIFEST_DIR/docker-containers.json"
+  fi
+
+  mapfile -t volume_names < <(docker volume ls -q)
+  if ((${#volume_names[@]} > 0)); then
+    docker volume inspect "${volume_names[@]}" >"$MANIFEST_DIR/docker-volumes.json" || true
+  else
+    printf 'nenhum volume\n' >"$MANIFEST_DIR/docker-volumes.json"
+  fi
+else
+  printf 'Docker indisponível ou daemon parado\n' >"$MANIFEST_DIR/docker-status.txt"
+  : >"$MANIFEST_DIR/docker-volumes.json"
+fi
+
+DOCKER_VOLUME_STATUS="$MANIFEST_DIR/docker-volume-archives.txt"
+if (( SKIP_DOCKER_VOLUMES == 1 )); then
+  printf 'volumes Docker desabilitados por --no-docker-volumes\n' >"$DOCKER_VOLUME_STATUS"
+elif (( DOCKER_AVAILABLE == 0 )); then
+  printf 'volumes Docker não arquivados: Docker indisponível\n' >"$DOCKER_VOLUME_STATUS"
+else
+  log "arquivando volumes Docker em modo somente leitura"
+  printf 'volume\tstatus\tarquivo\n' >"$DOCKER_VOLUME_STATUS"
+  log "a imagem $DOCKER_ARCHIVE_IMAGE será baixada pelo Docker se não estiver local"
+  mapfile -t volume_names < <(docker volume ls -q)
+  for volume_name in "${volume_names[@]}"; do
+    [[ -n "$volume_name" ]] || continue
+    archive_path="$DOCKER_VOLUME_DIR/${volume_name}.tar.gz"
+    if docker run --rm --network none --read-only \
+      --mount "type=volume,src=${volume_name},dst=/source,readonly" \
+      --mount "type=bind,src=${DOCKER_VOLUME_DIR},dst=/backup" \
+      "$DOCKER_ARCHIVE_IMAGE" \
+      sh -c 'tar -czf "/backup/$1.tar.gz" -C /source .' sh "$volume_name"; then
+      chmod u+rw "$archive_path" 2>/dev/null || true
+      printf '%s\tOK\t%s\n' "$volume_name" "$archive_path" >>"$DOCKER_VOLUME_STATUS"
+    else
+      warn "não foi possível arquivar o volume Docker: $volume_name"
+      printf '%s\tSKIPPED\tarchive-failed\n' "$volume_name" >>"$DOCKER_VOLUME_STATUS"
+    fi
+  done
+fi
+
+MANIFEST_FILE="$MANIFEST_DIR/omarchy-restic-manifest.txt"
+{
+  printf 'format=omarchy-restic-migration-v1\n'
+  printf 'created_at=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  printf 'source_user=%s\n' "$CURRENT_USER"
+  printf 'source_home=%s\n' "$CURRENT_HOME"
+  printf 'source_hostname=%s\n' "$(hostname)"
+  printf 'repository=%s\n' "$REPOSITORY"
+  printf 'docker_archive_image=%s\n' "$DOCKER_ARCHIVE_IMAGE"
+  printf 'docker_volume_archives=%s\n' "$DOCKER_VOLUME_STATUS"
+  printf 'excluded_paths=cache,trash,node_modules,vendor/bundle,.bundle,tmp,log,coverage,.terraform\n'
+} >"$MANIFEST_FILE"
+
+EXCLUDE_FILE="$STAGING_DIR/restic-excludes.txt"
+{
+  printf '%s\n' "$CURRENT_HOME/.cache"
+  printf '%s\n' "$CURRENT_HOME/.local/share/Trash"
+  printf '%s/**/node_modules\n' "$CURRENT_HOME"
+  printf '%s/**/vendor/bundle\n' "$CURRENT_HOME"
+  printf '%s/**/.bundle\n' "$CURRENT_HOME"
+  printf '%s/**/tmp\n' "$CURRENT_HOME"
+  printf '%s/**/log\n' "$CURRENT_HOME"
+  printf '%s/**/coverage\n' "$CURRENT_HOME"
+  printf '%s/**/.terraform\n' "$CURRENT_HOME"
+} >"$EXCLUDE_FILE"
+
+log "iniciando snapshot do HOME e do inventário"
+set +e
+restic_cmd backup --one-file-system --exclude-file "$EXCLUDE_FILE" --tag omarchy-migration "$CURRENT_HOME" "$STAGING_DIR"
+BACKUP_STATUS=$?
+set -e
+(( BACKUP_STATUS == 0 )) || die "o backup Restic falhou com status $BACKUP_STATUS"
+
+log "snapshot mais recente da migração"
+restic_cmd snapshots --tag omarchy-migration --latest 1
+
+log "validando a integridade do repositório"
+restic_cmd check
+
+log "backup concluído; o staging temporário será removido"

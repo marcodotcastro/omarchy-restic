@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+CURRENT_USER="${USER:-$(id -un)}"
+CURRENT_HOME="${HOME:?HOME não está definido}"
+DEFAULT_MOUNT="/media/${CURRENT_USER}/Backup"
+DEFAULT_REPOSITORY="${DEFAULT_MOUNT}/omarchy-restic-v2"
+REPOSITORY="${OMARCHY_RESTIC_REPOSITORY:-${RESTIC_REPOSITORY:-${DEFAULT_REPOSITORY}}}"
+SNAPSHOT_ID="latest"
+INSTALL_TOOLS=0
+RESTORE_DOCKER_VOLUMES=0
+REPLACE_DOCKER_VOLUMES=0
+YES=0
+PLAN_ONLY=0
+PASSWORD_FILE=""
+RESTORE_STAGE=""
+
+usage() {
+  cat <<'USAGE'
+Uso:
+  omarchy-restic-restore [opções]
+
+Restaura o snapshot mais recente com a tag omarchy-migration. Primeiro extrai
+e verifica os dados em uma área temporária; depois sincroniza o HOME atual,
+preservando cópias dos arquivos que forem sobrescritos.
+
+Opções:
+  --full                    restaura HOME, oferece ferramentas e Docker
+  --install-tools           instala ferramentas-base via pacman ou apt
+  --restore-docker-volumes restaura volumes Docker ausentes
+  --replace-docker-volumes substitui dados de volumes existentes (destrutivo)
+  --snapshot ID             usa um snapshot específico em vez de latest
+  --yes                     não pede confirmações; use somente após revisar
+  --plan                    mostra o plano sem acessar o repositório
+  -h, --help                mostra esta ajuda
+
+Variáveis opcionais:
+  OMARCHY_RESTIC_REPOSITORY  caminho do repositório Restic
+  RESTIC_REPOSITORY          alternativa ao caminho acima
+  OMARCHY_RESTIC_MOUNT       ponto de montagem do HD externo
+  OMARCHY_RESTIC_WORKDIR     área temporária para a restauração
+  OMARCHY_RESTIC_DOCKER_IMAGE imagem usada nos volumes Docker
+
+Exemplo completo após instalar o Omarchy:
+  omarchy-restic-restore --full
+
+Para execução sem perguntas, depois de revisar o plano:
+  omarchy-restic-restore --full --yes
+USAGE
+}
+
+log() {
+  printf '[restore] %s\n' "$*"
+}
+
+warn() {
+  printf '[restore][aviso] %s\n' "$*" >&2
+}
+
+die() {
+  printf '[restore][erro] %s\n' "$*" >&2
+  exit 1
+}
+
+ask_yes_no() {
+  local prompt="$1"
+  local answer
+
+  if (( YES == 1 )); then
+    return 0
+  fi
+
+  printf '%s [s/N] ' "$prompt" >&2
+  IFS= read -r answer || return 1
+  [[ "$answer" =~ ^[sS][iI]?[mM]?$ || "$answer" =~ ^[sSyY]$ ]]
+}
+
+record_optional() {
+  local output_file="$1"
+  shift
+  {
+    printf 'command:'
+    printf ' %q' "$@"
+    printf '\n'
+    if command -v "$1" >/dev/null 2>&1; then
+      "$@" || printf '\nexit_status: %s\n' "$?"
+    else
+      printf 'not_installed: %s\n' "$1"
+    fi
+  } >"$output_file" 2>&1
+}
+
+cleanup() {
+  local status=$?
+
+  if [[ -n "$PASSWORD_FILE" ]]; then
+    rm -f -- "$PASSWORD_FILE"
+  fi
+
+  if [[ -n "$RESTORE_STAGE" && -d "$RESTORE_STAGE" ]]; then
+    if (( status == 0 )); then
+      rm -rf -- "$RESTORE_STAGE"
+    else
+      warn "restauração temporária preservada para diagnóstico: $RESTORE_STAGE"
+    fi
+  fi
+
+  exit "$status"
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --full)
+      INSTALL_TOOLS=1
+      RESTORE_DOCKER_VOLUMES=1
+      ;;
+    --install-tools)
+      INSTALL_TOOLS=1
+      ;;
+    --restore-docker-volumes)
+      RESTORE_DOCKER_VOLUMES=1
+      ;;
+    --replace-docker-volumes)
+      RESTORE_DOCKER_VOLUMES=1
+      REPLACE_DOCKER_VOLUMES=1
+      ;;
+    --snapshot)
+      shift
+      (($# > 0)) || die "--snapshot precisa de um ID"
+      SNAPSHOT_ID="$1"
+      ;;
+    --yes)
+      YES=1
+      ;;
+    --plan)
+      PLAN_ONLY=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "opção desconhecida: $1 (use --help)"
+      ;;
+  esac
+  shift
+done
+
+if (( PLAN_ONLY == 1 )); then
+  printf 'Plano de restauração Restic\n'
+  printf '  repositório: %s\n' "$REPOSITORY"
+  printf '  snapshot: %s (tag omarchy-migration quando for latest)\n' "$SNAPSHOT_ID"
+  printf '  HOME: restaurar em %s sem --delete\n' "$CURRENT_HOME"
+  printf '  cópias dos sobrescritos: %s/.omarchy-restic-pre-restore-<data>\n' "$CURRENT_HOME"
+  if (( INSTALL_TOOLS == 1 )); then
+    printf '  ferramentas: instalar pacman/apt\n'
+  else
+    printf '  ferramentas: não instalar; use --install-tools ou --full\n'
+  fi
+  if (( RESTORE_DOCKER_VOLUMES == 1 )); then
+    printf '  Docker: restaurar volumes ausentes; existentes serão preservados\n'
+  else
+    printf '  Docker: não restaurar volumes; use --restore-docker-volumes ou --full\n'
+  fi
+  exit 0
+fi
+
+[[ "$EUID" -ne 0 ]] || die "execute como usuário normal, não como root"
+[[ -d "$CURRENT_HOME" ]] || die "HOME não existe: $CURRENT_HOME"
+command -v restic >/dev/null 2>&1 || die "restic não está instalado"
+command -v rsync >/dev/null 2>&1 || die "rsync não está instalado"
+
+if [[ "$REPOSITORY" == /media/*/Backup/* ]]; then
+  BACKUP_MOUNT="${OMARCHY_RESTIC_MOUNT:-$DEFAULT_MOUNT}"
+  command -v mountpoint >/dev/null 2>&1 || die "mountpoint não está disponível para validar o HD externo"
+  mountpoint -q "$BACKUP_MOUNT" || die "HD externo não está montado em $BACKUP_MOUNT"
+else
+  BACKUP_MOUNT="${OMARCHY_RESTIC_MOUNT:-$(dirname "$(dirname "$REPOSITORY")")}" 
+fi
+
+[[ -d "$REPOSITORY" ]] || die "repositório não encontrado: $REPOSITORY"
+
+if [[ -n "${OMARCHY_RESTIC_WORKDIR:-}" ]]; then
+  RESTORE_WORKDIR="$OMARCHY_RESTIC_WORKDIR"
+elif [[ -d "$BACKUP_MOUNT" && -w "$BACKUP_MOUNT" ]]; then
+  RESTORE_WORKDIR="$BACKUP_MOUNT"
+else
+  RESTORE_WORKDIR="${TMPDIR:-/tmp}"
+  warn "usando $RESTORE_WORKDIR para a restauração temporária; verifique o espaço livre"
+fi
+
+PASSWORD_FILE="$(mktemp "${TMPDIR:-/tmp}/omarchy-restic-password.XXXXXX")"
+chmod 600 "$PASSWORD_FILE"
+trap cleanup EXIT
+
+printf 'Senha do repositório Restic: ' >&2
+IFS= read -r -s RESTIC_PASSWORD_INPUT || die "não foi possível ler a senha"
+printf '\n' >&2
+[[ -n "$RESTIC_PASSWORD_INPUT" ]] || die "a senha não pode ser vazia"
+printf '%s\n' "$RESTIC_PASSWORD_INPUT" >"$PASSWORD_FILE"
+unset RESTIC_PASSWORD_INPUT
+export RESTIC_PASSWORD_FILE="$PASSWORD_FILE"
+
+restic_cmd() {
+  restic -r "$REPOSITORY" "$@"
+}
+
+log "validando o repositório: $REPOSITORY"
+restic_cmd snapshots --latest 1 >/dev/null
+
+RESTORE_STAGE="$(mktemp -d "$RESTORE_WORKDIR/.omarchy-restic-restore.XXXXXX")"
+chmod 700 "$RESTORE_STAGE"
+log "extraindo e verificando o snapshot em $RESTORE_STAGE"
+if [[ "$SNAPSHOT_ID" == latest ]]; then
+  restic_cmd restore latest --tag omarchy-migration --target "$RESTORE_STAGE" --verify
+else
+  restic_cmd restore "$SNAPSHOT_ID" --target "$RESTORE_STAGE" --verify
+fi
+
+MANIFEST_PATH="$(find "$RESTORE_STAGE" -type f -name omarchy-restic-manifest.txt -print -quit 2>/dev/null || true)"
+[[ -n "$MANIFEST_PATH" && -f "$MANIFEST_PATH" ]] || die "manifest de migração não encontrado no snapshot"
+
+SOURCE_HOME_ABSOLUTE="$(awk -F= '$1 == "source_home" {print substr($0, index($0, "=") + 1); exit}' "$MANIFEST_PATH")"
+[[ -n "$SOURCE_HOME_ABSOLUTE" && "$SOURCE_HOME_ABSOLUTE" == /* ]] || die "source_home inválido no manifest"
+SOURCE_HOME="$RESTORE_STAGE/${SOURCE_HOME_ABSOLUTE#/}"
+[[ -d "$SOURCE_HOME" ]] || die "HOME original não encontrado no snapshot: $SOURCE_HOME_ABSOLUTE"
+
+printf '\n'
+printf 'A restauração irá copiar:\n'
+printf '  origem:  %s\n' "$SOURCE_HOME"
+printf '  destino: %s\n' "$CURRENT_HOME"
+printf 'Arquivos existentes substituídos serão preservados em um diretório de segurança.\n'
+ask_yes_no 'Continuar com a restauração do HOME?' || die 'restauração cancelada pelo usuário'
+
+PRE_RESTORE_DIR="$CURRENT_HOME/.omarchy-restic-pre-restore-$(date '+%Y%m%d-%H%M%S')"
+mkdir -m 700 "$PRE_RESTORE_DIR"
+PREVIEW_FILE="$RESTORE_STAGE/rsync-preview.txt"
+log "calculando a cópia e preservando alterações existentes"
+rsync -a --dry-run --stats "$SOURCE_HOME/" "$CURRENT_HOME/" >"$PREVIEW_FILE"
+tail -n 20 "$PREVIEW_FILE"
+rsync -a --backup --backup-dir="$PRE_RESTORE_DIR" "$SOURCE_HOME/" "$CURRENT_HOME/"
+log "HOME restaurado; cópias anteriores estão em $PRE_RESTORE_DIR"
+
+install_base_tools() {
+  local -a packages
+
+  if command -v pacman >/dev/null 2>&1; then
+    packages=(git docker docker-compose github-cli restic rsync ruby nodejs npm postgresql ripgrep fd jq unzip python python-pip zsh)
+    log "instalando ferramentas-base via pacman"
+    command -v sudo >/dev/null 2>&1 || { warn 'sudo não está instalado; ferramentas não foram instaladas'; return 0; }
+    sudo pacman -S --needed "${packages[@]}"
+    if command -v systemctl >/dev/null 2>&1 && command -v docker >/dev/null 2>&1; then
+      sudo systemctl enable --now docker || warn 'não foi possível iniciar o serviço Docker'
+    fi
+  elif command -v apt-get >/dev/null 2>&1; then
+    packages=(git docker.io docker-compose-v2 restic rsync ruby-full nodejs npm postgresql-client ripgrep fd-find jq unzip python3 python3-pip zsh)
+    log "instalando ferramentas-base via apt"
+    command -v sudo >/dev/null 2>&1 || { warn 'sudo não está instalado; ferramentas não foram instaladas'; return 0; }
+    sudo apt-get update
+    sudo apt-get install -y "${packages[@]}"
+  else
+    warn 'nenhum gerenciador pacman/apt encontrado; consulte o inventário restaurado'
+  fi
+}
+
+install_flatpaks() {
+  local flatpak_ids_file="$1"
+  local application_id
+
+  [[ -s "$flatpak_ids_file" ]] || return 0
+  command -v flatpak >/dev/null 2>&1 || { warn 'Flatpak não instalado; aplicativos Flatpak não foram restaurados'; return 0; }
+  if ! flatpak remotes --columns=name 2>/dev/null | grep -Fxq flathub; then
+    warn 'remote Flathub não encontrado; aplicativos Flatpak não foram restaurados'
+    return 0
+  fi
+
+  while IFS= read -r application_id; do
+    [[ -n "$application_id" ]] || continue
+    flatpak install -y flathub "$application_id" || warn "não foi possível instalar Flatpak: $application_id"
+  done <"$flatpak_ids_file"
+}
+
+restore_docker_volumes() {
+  local manifest_directory
+  local volume_directory
+  local docker_image
+  local archive_path
+  local archive_name
+  local volume_name
+  local -a archives
+
+  command -v docker >/dev/null 2>&1 || { warn 'Docker não está instalado; volumes não foram restaurados'; return 0; }
+  if ! docker info >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+      sudo systemctl start docker >/dev/null 2>&1 || true
+    fi
+  fi
+  docker info >/dev/null 2>&1 || { warn 'daemon Docker indisponível; volumes não foram restaurados'; return 0; }
+
+  manifest_directory="$(dirname "$MANIFEST_PATH")"
+  volume_directory="$manifest_directory/../docker/volumes"
+  [[ -d "$volume_directory" ]] || { warn 'nenhum arquivo de volume Docker encontrado'; return 0; }
+  docker_image="$(awk -F= '$1 == "docker_archive_image" {print substr($0, index($0, "=") + 1); exit}' "$MANIFEST_PATH")"
+  docker_image="${docker_image:-${OMARCHY_RESTIC_DOCKER_IMAGE:-busybox:1.36}}"
+  shopt -s nullglob
+  archives=("$volume_directory"/*.tar.gz)
+  shopt -u nullglob
+  ((${#archives[@]} > 0)) || { warn 'nenhum volume Docker arquivado'; return 0; }
+
+  log "restaurando volumes Docker ausentes; volumes existentes serão preservados"
+  for archive_path in "${archives[@]}"; do
+    archive_name="$(basename "$archive_path")"
+    volume_name="${archive_name%.tar.gz}"
+    if docker volume inspect "$volume_name" >/dev/null 2>&1; then
+      if (( REPLACE_DOCKER_VOLUMES == 0 )); then
+        warn "volume existente preservado: $volume_name"
+        continue
+      fi
+      ask_yes_no "SUBSTITUIR o conteúdo do volume Docker $volume_name?" || {
+        warn "volume preservado: $volume_name"
+        continue
+      }
+      docker run --rm --network none --read-only \
+        --mount "type=volume,src=${volume_name},dst=/destination" \
+        "$docker_image" \
+        sh -c 'find /destination -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +'
+    else
+      docker volume create "$volume_name" >/dev/null
+    fi
+
+    if docker run --rm --network none --read-only \
+      --mount "type=volume,src=${volume_name},dst=/destination" \
+      --mount "type=bind,src=${volume_directory},dst=/backup,readonly" \
+      "$docker_image" \
+      sh -c 'tar -xzf "/backup/$1" -C /destination' sh "$archive_name"; then
+      log "volume restaurado: $volume_name"
+    else
+      warn "falha ao restaurar volume: $volume_name"
+    fi
+  done
+}
+
+if (( INSTALL_TOOLS == 1 )); then
+  install_base_tools
+  install_flatpaks "$(dirname "$MANIFEST_PATH")/../packages/flatpak-application-ids.txt"
+fi
+
+if (( RESTORE_DOCKER_VOLUMES == 1 )); then
+  restore_docker_volumes
+fi
+
+log "restauração concluída; a área temporária será removida"
