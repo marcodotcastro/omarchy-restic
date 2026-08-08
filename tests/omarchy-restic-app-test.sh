@@ -144,5 +144,35 @@ assert_contains "$manifest_path" 'app.1.id=fixture-one' 'manifest contém fixtur
 assert_contains "$manifest_path" 'app.2.id=fixture-two' 'manifest contém fixture-two'
 assert_contains "$manifest_path" 'app.3.id=fixture-three' 'manifest contém fixture-three'
 assert_contains "$manifest_path" $'\tsha256=' 'manifest contém SHA-256'
+assert_contains "$manifest_path" $'\trole=installation\t' 'manifest contém caminhos de instalação'
+
+verify_output="$TEST_ROOT/verify-capture.txt"
+set +e
+run_app_test verify-capture --catalog "$catalog" --workdir "$WORKDIR" >"$verify_output" 2>&1
+verify_status=$?
+set -e
+assert_status 0 "$verify_status" 'verify-capture'
+assert_contains "$verify_output" 'PASS' 'verify-capture informa sucesso'
+
+rm -f \
+  "$FIXTURE_HOME/.local/share/fixture-one/bin/fixture-one" \
+  "$FIXTURE_HOME/.local/share/fixture-two/bin/fixture-two" \
+  "$FIXTURE_HOME/.local/share/fixture-three/bin/fixture-three"
+
+removed_output="$TEST_ROOT/assert-removed.txt"
+set +e
+run_app_test assert-removed --catalog "$catalog" --workdir "$WORKDIR" >"$removed_output" 2>&1
+removed_status=$?
+set -e
+assert_status 0 "$removed_status" 'assert-removed sem artefatos'
+assert_contains "$removed_output" 'PASS' 'assert-removed informa sucesso'
+
+printf '#!/usr/bin/env bash\n' >"$FIXTURE_HOME/.local/share/fixture-two/bin/fixture-two"
+chmod 700 "$FIXTURE_HOME/.local/share/fixture-two/bin/fixture-two"
+expect_failure_contains \
+  'assert-removed com artefato restante' \
+  'fixture-two' \
+  run_app_test assert-removed --catalog "$catalog" --workdir "$WORKDIR"
+rm -f "$FIXTURE_HOME/.local/share/fixture-two/bin/fixture-two"
 
 printf 'PASS: harness inicial\n'

@@ -198,8 +198,9 @@ record_tree() {
   local recorded_path
 
   while IFS= read -r -d '' path; do
-    [[ -z "${MANIFEST_PATH_SET[$path]+present}" ]] || continue
-    MANIFEST_PATH_SET["$path"]=1
+    local record_key="${path}|${app_id}|${role}"
+    [[ -z "${MANIFEST_PATH_SET[$record_key]+present}" ]] || continue
+    MANIFEST_PATH_SET["$record_key"]=1
 
     if path_is_inside_home "$path"; then
       scope='home'
@@ -319,6 +320,175 @@ capture_phase() {
 
   log 'snapshot de teste criado; listando o snapshot mais recente'
   restic_cmd snapshots --tag "$APP_TEST_TAG" --latest 1
+}
+
+ensure_workdir() {
+  if [[ -n "$WORKDIR" ]]; then
+    [[ -d "$WORKDIR" && -w "$WORKDIR" ]] || die "workdir não existe ou não permite escrita: $WORKDIR"
+  else
+    WORKDIR="${OMARCHY_RESTIC_WORKDIR:-${TMPDIR:-/tmp}}"
+    [[ -d "$WORKDIR" && -w "$WORKDIR" ]] || die "workdir não existe ou não permite escrita: $WORKDIR"
+  fi
+}
+
+select_snapshot() {
+  local snapshot_output
+
+  [[ "$SNAPSHOT_ID" != latest ]] && return 0
+  snapshot_output="$(restic_cmd snapshots --tag "$APP_TEST_TAG" --latest 1)" || die "não foi possível localizar um snapshot com a tag $APP_TEST_TAG"
+  SNAPSHOT_ID="$(printf '%s\n' "$snapshot_output" | awk '$1 ~ /^[[:xdigit:]]{8,}$/ {print $1; exit}')"
+  [[ -n "$SNAPSHOT_ID" ]] || die "nenhum snapshot com a tag $APP_TEST_TAG foi encontrado"
+}
+
+restore_snapshot_stage() {
+  local manifest_format
+  local source_home
+  local app_count
+
+  ensure_workdir
+  STAGING_DIR="$(mktemp -d "$WORKDIR/.omarchy-restic-app-restore.XXXXXX")"
+  chmod 700 "$STAGING_DIR"
+  select_snapshot
+  log "restaurando e verificando o snapshot $SNAPSHOT_ID"
+  restic_cmd restore "$SNAPSHOT_ID" --target "$STAGING_DIR" --verify
+
+  MANIFEST_PATH="$(find "$STAGING_DIR" -type f -name omarchy-app-test-manifest.txt -print -quit 2>/dev/null || true)"
+  [[ -n "$MANIFEST_PATH" && -f "$MANIFEST_PATH" ]] || die 'manifest de teste não encontrado no snapshot'
+  manifest_format="$(manifest_value format)"
+  [[ "$manifest_format" == omarchy-app-test-v1 ]] || die "formato de manifest inválido: $manifest_format"
+  source_home="$(manifest_value source_home)"
+  [[ -n "$source_home" && "$source_home" == /* ]] || die 'source_home inválido no manifest'
+  app_count="$(manifest_value app_count)"
+  [[ "$app_count" == 3 ]] || die "manifest deve conter três aplicativos; encontrado: $app_count"
+}
+
+manifest_value() {
+  local key="$1"
+
+  awk -F= -v wanted="$key" '$1 == wanted {sub(/^[^=]*=/, ""); print; exit}' "$MANIFEST_PATH"
+}
+
+check_manifest_record() {
+  local path="$1"
+  local expected_type="$2"
+  local expected_mode="$3"
+  local expected_size="$4"
+  local expected_checksum="$5"
+  local expected_link_target="$6"
+  local actual_mode
+  local actual_size
+  local actual_checksum
+  local actual_link_target
+
+  if [[ "$expected_type" == file ]]; then
+    [[ -f "$path" && ! -L "$path" ]] || die "arquivo ausente ou tipo divergente na validação: $path"
+    actual_mode="$(stat -c '%a' -- "$path")"
+    actual_size="$(stat -c '%s' -- "$path")"
+    actual_checksum="$(sha256sum -- "$path" | awk '{print $1}')"
+    [[ "$actual_mode" == "$expected_mode" ]] || die "modo divergente na validação: $path"
+    [[ "$actual_size" == "$expected_size" ]] || die "tamanho divergente na validação: $path"
+    [[ "$actual_checksum" == "$expected_checksum" ]] || die "SHA-256 divergente na validação: $path"
+  elif [[ "$expected_type" == directory ]]; then
+    [[ -d "$path" && ! -L "$path" ]] || die "diretório ausente ou tipo divergente na validação: $path"
+    actual_mode="$(stat -c '%a' -- "$path")"
+    [[ "$actual_mode" == "$expected_mode" ]] || die "modo divergente na validação: $path"
+  elif [[ "$expected_type" == symlink ]]; then
+    [[ -L "$path" ]] || die "symlink ausente ou tipo divergente na validação: $path"
+    actual_mode="$(stat -c '%a' -- "$path")"
+    actual_link_target="$(readlink -- "$path")"
+    [[ "$actual_mode" == "$expected_mode" ]] || die "modo divergente na validação: $path"
+    [[ "$actual_link_target" == "$expected_link_target" ]] || die "destino de symlink divergente na validação: $path"
+  else
+    die "tipo desconhecido no manifest: $expected_type"
+  fi
+}
+
+verify_manifest_records() {
+  local base_path="$1"
+  local first_field
+  local app_field
+  local role_field
+  local scope_field
+  local type_field
+  local mode_field
+  local size_field
+  local checksum_field
+  local link_target_field
+  local path
+  local target
+
+  while IFS=$'\t' read -r first_field app_field role_field scope_field type_field mode_field size_field checksum_field link_target_field; do
+    [[ "$first_field" == path=* ]] || continue
+    path="${first_field#path=}"
+    target="$base_path/${path#/}"
+    check_manifest_record \
+      "$target" \
+      "${type_field#type=}" \
+      "${mode_field#mode=}" \
+      "${size_field#size=}" \
+      "${checksum_field#sha256=}" \
+      "${link_target_field#link_target=}"
+  done <"$MANIFEST_PATH"
+}
+
+verify_capture_phase() {
+  [[ "$EUID" -ne 0 ]] || die 'execute como usuário normal, não como root'
+  command -v restic >/dev/null 2>&1 || die 'restic não está instalado'
+  command -v find >/dev/null 2>&1 || die 'find não está disponível'
+  command -v sha256sum >/dev/null 2>&1 || die 'sha256sum não está disponível'
+  command -v stat >/dev/null 2>&1 || die 'stat não está disponível'
+  [[ -d "$REPOSITORY" ]] || die "repositório não encontrado: $REPOSITORY"
+  load_password
+  trap cleanup EXIT
+  restore_snapshot_stage
+  verify_manifest_records "$STAGING_DIR"
+  log 'PASS: captura restaurada e verificada com --verify'
+}
+
+assert_removed_phase() {
+  local first_field
+  local app_field
+  local role_field
+  local scope_field
+  local type_field
+  local mode_field
+  local size_field
+  local checksum_field
+  local link_target_field
+  local path
+  local failures=0
+  local app_number
+  local app_id
+  local command_name
+
+  [[ "$EUID" -ne 0 ]] || die 'execute como usuário normal, não como root'
+  command -v restic >/dev/null 2>&1 || die 'restic não está instalado'
+  [[ -d "$REPOSITORY" ]] || die "repositório não encontrado: $REPOSITORY"
+  load_password
+  trap cleanup EXIT
+  restore_snapshot_stage
+
+  while IFS=$'\t' read -r first_field app_field role_field scope_field type_field mode_field size_field checksum_field link_target_field; do
+    [[ "$first_field" == path=* ]] || continue
+    [[ "${role_field#role=}" == installation ]] || continue
+    path="${first_field#path=}"
+    if [[ -e "$path" || -L "$path" ]]; then
+      printf '[app-test][FAIL] artefato de instalação ainda existe: %s\n' "$path" >&2
+      failures=$((failures + 1))
+    fi
+  done <"$MANIFEST_PATH"
+
+  for app_number in 1 2 3; do
+    app_id="$(manifest_value "app.${app_number}.id")"
+    command_name="$(manifest_value "app.${app_number}.command")"
+    if [[ -n "$command_name" ]] && command -v "$command_name" >/dev/null 2>&1; then
+      printf '[app-test][FAIL] comando de instalação ainda existe para %s: %s\n' "$app_id" "$command_name" >&2
+      failures=$((failures + 1))
+    fi
+  done
+
+  ((failures == 0)) || die "assert-removed encontrou $failures artefato(s) ainda instalado(s)"
+  log 'PASS: artefatos de instalação foram removidos manualmente'
 }
 
 catalog_load() {
@@ -477,6 +647,16 @@ catalog_load
 if [[ "$PHASE" == capture ]]; then
   validate_selected_apps
   capture_phase
+  exit 0
+fi
+
+if [[ "$PHASE" == verify-capture ]]; then
+  verify_capture_phase
+  exit 0
+fi
+
+if [[ "$PHASE" == assert-removed ]]; then
+  assert_removed_phase
   exit 0
 fi
 
