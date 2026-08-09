@@ -20,6 +20,10 @@ TEMP_PASSWORD_FILE=""
 STAGING_DIR=""
 MANIFEST_PATH=""
 EXCLUDE_FILE=""
+REHEARSAL_DIR=""
+REHEARSAL_HOME=""
+REHEARSAL_WORKDIR=""
+REHEARSAL_TOKEN=""
 declare -a BACKUP_PATHS=()
 declare -A BACKUP_PATH_SET=()
 declare -A MANIFEST_PATH_SET=()
@@ -41,7 +45,8 @@ Uso:
 Fases:
   capture          captura exatamente três aplicativos em um snapshot de teste
   verify-capture   restaura e verifica o snapshot sem alterar o HOME
-  assert-removed   confirma a remoção manual dos artefatos de instalação
+  rehearse         executa captura, remoção simulada, restore e validação isolados
+  assert-removed   confirma a remoção dos artefatos de instalação no ambiente atual
   restore          restaura somente os caminhos de usuário selecionados
   validate         compara o estado restaurado com o manifest capturado
 
@@ -89,6 +94,14 @@ cleanup() {
       rm -rf -- "$STAGING_DIR"
     else
       printf '[app-test][aviso] staging preservado para diagnóstico: %s\n' "$STAGING_DIR" >&2
+    fi
+  fi
+
+  if [[ -n "$REHEARSAL_DIR" && -d "$REHEARSAL_DIR" ]]; then
+    if (( status == 0 && KEEP_STAGE == 0 )); then
+      rm -rf -- "$REHEARSAL_DIR"
+    else
+      printf '[app-test][aviso] ensaio descartável preservado para diagnóstico: %s\n' "$REHEARSAL_DIR" >&2
     fi
   fi
 
@@ -361,6 +374,23 @@ manifest_value() {
   awk -F= -v wanted="$key" '$1 == wanted {sub(/^[^=]*=/, ""); print; exit}' "$MANIFEST_PATH"
 }
 
+map_manifest_path_to_current_home() {
+  local path="$1"
+  local source_home="$2"
+
+  case "$path" in
+    "$source_home"/*)
+      printf '%s/%s\n' "$CURRENT_HOME" "${path#"$source_home"/}"
+      ;;
+    "$source_home")
+      printf '%s\n' "$CURRENT_HOME"
+      ;;
+    *)
+      printf '%s\n' "$path"
+      ;;
+  esac
+}
+
 check_manifest_record() {
   local path="$1"
   local expected_type="$2"
@@ -449,10 +479,12 @@ assert_removed_phase() {
   local checksum_field
   local link_target_field
   local path
+  local source_home
   local failures=0
   local app_number
   local app_id
   local command_name
+  local command_path
 
   [[ "$EUID" -ne 0 ]] || die 'execute como usuário normal, não como root'
   command -v restic >/dev/null 2>&1 || die 'restic não está instalado'
@@ -460,11 +492,13 @@ assert_removed_phase() {
   load_password
   trap cleanup EXIT
   restore_snapshot_stage
+  source_home="$(manifest_value source_home)"
 
   while IFS=$'\t' read -r first_field app_field role_field scope_field type_field mode_field size_field checksum_field link_target_field; do
     [[ "$first_field" == path=* ]] || continue
     [[ "${role_field#role=}" == installation ]] || continue
     path="${first_field#path=}"
+    path="$(map_manifest_path_to_current_home "$path" "$source_home")"
     if [[ -e "$path" || -L "$path" ]]; then
       printf '[app-test][FAIL] artefato de instalação ainda existe: %s\n' "$path" >&2
       failures=$((failures + 1))
@@ -474,14 +508,159 @@ assert_removed_phase() {
   for app_number in 1 2 3; do
     app_id="$(manifest_value "app.${app_number}.id")"
     command_name="$(manifest_value "app.${app_number}.command")"
-    if [[ -n "$command_name" ]] && command -v "$command_name" >/dev/null 2>&1; then
-      printf '[app-test][FAIL] comando de instalação ainda existe para %s: %s\n' "$app_id" "$command_name" >&2
-      failures=$((failures + 1))
+    if [[ -n "$command_name" ]]; then
+      command_path="$(command -v "$command_name" || true)"
+      if [[ "${OMARCHY_RESTIC_APP_TEST_SANDBOX:-0}" == 1 ]]; then
+        if [[ "$command_path" == "$CURRENT_HOME"/* ]]; then
+          printf '[app-test][FAIL] comando de instalação ainda existe para %s: %s\n' "$app_id" "$command_name" >&2
+          failures=$((failures + 1))
+        fi
+      elif [[ -n "$command_path" ]]; then
+        printf '[app-test][FAIL] comando de instalação ainda existe para %s: %s\n' "$app_id" "$command_name" >&2
+        failures=$((failures + 1))
+      fi
     fi
   done
 
   ((failures == 0)) || die "assert-removed encontrou $failures artefato(s) ainda instalado(s)"
   log 'PASS: artefatos de instalação foram removidos manualmente'
+}
+
+assert_rehearsal_sandbox() {
+  local marker_path="$CURRENT_HOME/.omarchy-restic-app-test-sandbox"
+  local marker_contents
+
+  [[ "${OMARCHY_RESTIC_APP_TEST_SANDBOX:-0}" == 1 ]] || die 'remoção simulada exige o sandbox interno do ensaio'
+  [[ -n "${OMARCHY_RESTIC_APP_TEST_SANDBOX_HOME:-}" ]] || die 'sandbox do ensaio não foi identificado'
+  [[ -n "${OMARCHY_RESTIC_APP_TEST_SANDBOX_ROOT:-}" ]] || die 'raiz do sandbox do ensaio não foi identificada'
+  [[ -n "${OMARCHY_RESTIC_APP_TEST_SANDBOX_TOKEN:-}" ]] || die 'token do sandbox do ensaio não foi identificado'
+  [[ "$CURRENT_HOME" == "$OMARCHY_RESTIC_APP_TEST_SANDBOX_HOME" ]] || die 'HOME não corresponde ao sandbox do ensaio'
+  [[ "$CURRENT_HOME" == "$OMARCHY_RESTIC_APP_TEST_SANDBOX_ROOT/home" ]] || die 'HOME não é o diretório descartável esperado'
+  [[ -d "$OMARCHY_RESTIC_APP_TEST_SANDBOX_ROOT" && ! -L "$OMARCHY_RESTIC_APP_TEST_SANDBOX_ROOT" ]] || die 'raiz do sandbox não é um diretório seguro'
+  [[ -d "$CURRENT_HOME" && ! -L "$CURRENT_HOME" ]] || die 'HOME do ensaio não é um diretório seguro'
+  [[ -f "$marker_path" && ! -L "$marker_path" ]] || die 'marcador do sandbox não encontrado'
+  marker_contents="$(<"$marker_path")"
+  [[ "$marker_contents" == "omarchy-restic-app-test sandbox:$OMARCHY_RESTIC_APP_TEST_SANDBOX_TOKEN" ]] || die 'marcador do sandbox não confere'
+}
+
+simulate_removal_phase() {
+  local source_home
+  local first_field
+  local app_field
+  local role_field
+  local scope_field
+  local type_field
+  local mode_field
+  local size_field
+  local checksum_field
+  local link_target_field
+  local path
+  local target
+  local role
+  local scope
+  local removed_count=0
+
+  [[ "$EUID" -ne 0 ]] || die 'execute como usuário normal, não como root'
+  command -v restic >/dev/null 2>&1 || die 'restic não está instalado'
+  [[ -d "$REPOSITORY" ]] || die "repositório não encontrado: $REPOSITORY"
+  assert_rehearsal_sandbox
+  load_password
+  trap cleanup EXIT
+  restore_snapshot_stage
+  source_home="$(manifest_value source_home)"
+
+  while IFS=$'\t' read -r first_field app_field role_field scope_field type_field mode_field size_field checksum_field link_target_field; do
+    [[ "$first_field" == path=* ]] || continue
+    role="${role_field#role=}"
+    scope="${scope_field#scope=}"
+    [[ "$role" == installation || "$role" == launcher ]] || continue
+    [[ "$scope" == home ]] || continue
+
+    path="${first_field#path=}"
+    target="$(map_manifest_path_to_current_home "$path" "$source_home")"
+    [[ "$target" != "$CURRENT_HOME" ]] || die 'remoção simulada recusou o HOME inteiro'
+    assert_safe_destination "$target"
+    if [[ -e "$target" || -L "$target" ]]; then
+      rm -rf -- "$target"
+      removed_count=$((removed_count + 1))
+    fi
+  done <"$MANIFEST_PATH"
+
+  ((removed_count > 0)) || die 'remoção simulada não encontrou artefatos no sandbox'
+  log "PASS: remoção simulada isolada concluída ($removed_count artefato(s))"
+}
+
+run_rehearsal_child() {
+  local child_home="$1"
+  local sandbox_flag="$2"
+  local phase="$3"
+  shift 3
+
+  HOME="$child_home" \
+    USER="$CURRENT_USER" \
+    OMARCHY_RESTIC_REPOSITORY="$REPOSITORY" \
+    OMARCHY_RESTIC_PASSWORD_FILE="$PASSWORD_FILE" \
+    RESTIC_PASSWORD_FILE="$PASSWORD_FILE" \
+    OMARCHY_RESTIC_APP_TEST_SANDBOX="$sandbox_flag" \
+    OMARCHY_RESTIC_APP_TEST_SANDBOX_HOME="$child_home" \
+    OMARCHY_RESTIC_APP_TEST_SANDBOX_ROOT="$REHEARSAL_DIR" \
+    OMARCHY_RESTIC_APP_TEST_SANDBOX_TOKEN="$REHEARSAL_TOKEN" \
+    "$SCRIPT_DIR/omarchy-restic-app-test" "$phase" \
+    --catalog "$CATALOG_PATH" \
+    --snapshot "$SNAPSHOT_ID" \
+    --workdir "$REHEARSAL_WORKDIR" \
+    "$@"
+}
+
+rehearse_phase() {
+  local app_id
+  local capture_output
+  local -a capture_apps=()
+
+  [[ "$EUID" -ne 0 ]] || die 'execute como usuário normal, não como root'
+  command -v restic >/dev/null 2>&1 || die 'restic não está instalado'
+  command -v rsync >/dev/null 2>&1 || die 'rsync não está instalado'
+  [[ -d "$REPOSITORY" ]] || die "repositório não encontrado: $REPOSITORY"
+  validate_selected_apps
+  ensure_workdir
+  load_password
+  trap cleanup EXIT
+  restic_cmd cat config >/dev/null
+
+  REHEARSAL_DIR="$(mktemp -d "$WORKDIR/.omarchy-restic-app-rehearsal.XXXXXX")"
+  chmod 700 "$REHEARSAL_DIR"
+  REHEARSAL_TOKEN="$(basename -- "$REHEARSAL_DIR")"
+  REHEARSAL_HOME="$REHEARSAL_DIR/home"
+  REHEARSAL_WORKDIR="$REHEARSAL_DIR/workdir"
+  mkdir -m 700 "$REHEARSAL_HOME" "$REHEARSAL_WORKDIR"
+
+  for app_id in "${APP_IDS[@]}"; do
+    capture_apps+=(--app "$app_id")
+  done
+
+  log 'fase 1/6: capturando os aplicativos selecionados'
+  capture_output="$REHEARSAL_DIR/capture-output.txt"
+  run_rehearsal_child "$CURRENT_HOME" 0 capture "${capture_apps[@]}" >"$capture_output" 2>&1
+  cat "$capture_output"
+  SNAPSHOT_ID="$(awk '$1 == "snapshot" && $3 == "saved" {print $2; exit}' "$capture_output")"
+  [[ -n "$SNAPSHOT_ID" ]] || die 'não foi possível identificar o snapshot recém-criado'
+  log 'fase 2/6: verificando a captura com restore --verify'
+  run_rehearsal_child "$CURRENT_HOME" 0 verify-capture
+  log 'fase 3/6: restaurando a captura para um HOME descartável'
+  run_rehearsal_child "$REHEARSAL_HOME" 1 restore --yes
+
+  printf 'omarchy-restic-app-test sandbox:%s\n' "$REHEARSAL_TOKEN" >"$REHEARSAL_HOME/.omarchy-restic-app-test-sandbox"
+  chmod 600 "$REHEARSAL_HOME/.omarchy-restic-app-test-sandbox"
+
+  log 'fase 4/6: removendo somente os artefatos dentro do sandbox'
+  run_rehearsal_child "$REHEARSAL_HOME" 1 simulate-removal
+  log 'fase 5/6: confirmando a remoção simulada'
+  run_rehearsal_child "$REHEARSAL_HOME" 1 assert-removed
+  log 'fase 6/6: restaurando e validando o HOME descartável'
+  run_rehearsal_child "$REHEARSAL_HOME" 1 restore --yes
+  run_rehearsal_child "$REHEARSAL_HOME" 1 validate
+
+  log 'PASS: ensaio descartável completo; o HOME real não foi alterado'
 }
 
 ask_yes_no() {
@@ -588,6 +767,7 @@ restore_home_records() {
     assert_safe_destination "$destination_path"
 
     if [[ "$type" == directory ]]; then
+      mkdir -p -- "$destination_path"
       rsync -a --backup --backup-dir="$PRE_RESTORE_DIR" "$source_path/" "$destination_path/"
       RESTORE_ROOTS+=("$path")
     else
@@ -853,7 +1033,7 @@ parse_arguments() {
   done
 }
 
-[[ "$1" == capture || "$1" == verify-capture || "$1" == assert-removed || "$1" == restore || "$1" == validate ]] || die "fase desconhecida: $1"
+[[ "$1" == capture || "$1" == verify-capture || "$1" == rehearse || "$1" == simulate-removal || "$1" == assert-removed || "$1" == restore || "$1" == validate ]] || die "fase desconhecida: $1"
 parse_arguments "$@"
 
 catalog_load
@@ -865,6 +1045,16 @@ fi
 
 if [[ "$PHASE" == verify-capture ]]; then
   verify_capture_phase
+  exit 0
+fi
+
+if [[ "$PHASE" == rehearse ]]; then
+  rehearse_phase
+  exit 0
+fi
+
+if [[ "$PHASE" == simulate-removal ]]; then
+  simulate_removal_phase
   exit 0
 fi
 

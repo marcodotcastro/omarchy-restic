@@ -352,11 +352,11 @@ git commit -m "feat: restore and validate selected application state"
 
 - [ ] **Step 1: Add documentation assertions.**
 
-The test script help and README must contain the phase order and these safety statements:
+The test script help and README must contain the automated phase order and these safety statements:
 
 ```text
-capture -> verify-capture -> manual uninstall -> assert-removed -> restore -> validate
-the test does not remove applications automatically
+capture -> verify-capture -> restore in disposable HOME -> simulated removal -> assert-removed -> restore -> validate
+the test removes artifacts only inside the disposable HOME
 system paths are staged and are not copied with sudo automatically
 the main omarchy-migration snapshot remains required
 ```
@@ -375,24 +375,19 @@ Add this workflow to `README.md`, replacing `<terceiro-app>` with a catalog ID:
 chmod 700 omarchy-restic-app-test
 export RESTIC_REPOSITORY="/media/$USER/Backup/omarchy-restic-v2"
 
-./omarchy-restic-app-test capture \
+./omarchy-restic-app-test rehearse \
   --app rubymine \
   --app jetbrains-toolbox \
   --app <terceiro-app>
-./omarchy-restic-app-test verify-capture
-
-# O usuário desinstala manualmente os três aplicativos aqui.
-./omarchy-restic-app-test assert-removed
-./omarchy-restic-app-test restore
-./omarchy-restic-app-test validate
 ```
 
 Document that the current machine must first have the RubyMine, Toolbox, and
 Obsidian executables installed for `capture` to perform a complete executable
 test. Explain that `~/.config/JetBrains/RubyMine*` is preserved as user state,
-while an absent Toolbox binary cannot be inferred from those settings. Add the
-new script and catalog to the `install` commands that copy migration tools to
-the external disk.
+while an absent Toolbox binary cannot be inferred from those settings. The
+`rehearse` phase must delete only inside its temporary HOME and preserve the
+real HOME even on failure. Add the new script and catalog to the `install`
+commands that copy migration tools to the external disk.
 
 - [ ] **Step 4: Run documentation checks and commit.**
 
@@ -444,9 +439,13 @@ git log --oneline -8
 
 Confirm that only the new feature files and README are part of the implementation commits. Preserve the existing untracked application inventory and prior environment design document unless the user explicitly requests them to be committed.
 
-- [ ] **Step 4: Prepare the real-machine rehearsal without uninstalling anything automatically.**
+- [ ] **Step 4: Prepare the real-machine rehearsal without changing the real HOME.**
 
-Run `capture` and `verify-capture` first. If either fails because RubyMine/Toolbox is not currently installed, stop and report that the configuration-only backup remains possible but the executable removal/restore test is not yet valid. Only after both phases pass should the user manually close and uninstall the three selected applications, then run `assert-removed`, `restore`, and `validate`.
+Run `rehearse` after closing the selected applications. If it fails because
+RubyMine/Toolbox/Obsidian is not currently installed, stop and report that the
+configuration-only backup remains possible but the executable removal/restore
+test is not yet valid. The rehearsal itself never uninstalls applications from
+the real HOME.
 
 - [ ] **Step 5: Final handoff.**
 
@@ -459,4 +458,5 @@ Report separate evidence for:
 - any missing installer or executable;
 - existing full migration verification status.
 
-Do not claim the real RubyMine/Toolbox test passed until the user has performed the manual uninstall and the final `validate` command exits zero.
+Do not claim the real RubyMine/Toolbox test passed until the `rehearse` command
+has captured the current installation and its final `validate` phase exits zero.

@@ -238,6 +238,26 @@ set -e
 assert_status 0 "$realistic_verify_status" 'verify-capture com caminhos reais do Toolbox e Obsidian'
 assert_contains "$realistic_verify_output" 'PASS' 'verify-capture realista informa sucesso'
 
+realistic_rehearsal_output="$TEST_ROOT/realistic-rehearsal.txt"
+set +e
+run_realistic_test rehearse \
+  --catalog "$realistic_catalog" \
+  --app fixture-rubymine \
+  --app fixture-toolbox \
+  --app fixture-obsidian \
+  --workdir "$realistic_workdir" >"$realistic_rehearsal_output" 2>&1
+realistic_rehearsal_status=$?
+set -e
+assert_status 0 "$realistic_rehearsal_status" 'ensaio descartável completo'
+assert_contains "$realistic_rehearsal_output" 'PASS: ensaio descartável completo' 'ensaio informa sucesso'
+[[ -f "$realistic_home/.config/JetBrains/RubyMine2026.1/options/recentProjects.xml" ]] || fail 'ensaio alterou a configuração realista do RubyMine'
+[[ -f "$realistic_home/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox" ]] || fail 'ensaio removeu o Toolbox realista'
+[[ -L "$realistic_home/.local/bin/obsidian" ]] || fail 'ensaio removeu o symlink realista do Obsidian'
+expect_failure_contains \
+  'remoção simulada sem sandbox' \
+  'sandbox interno' \
+  run_realistic_test simulate-removal --catalog "$realistic_catalog" --workdir "$realistic_workdir"
+
 capture_output="$TEST_ROOT/capture.txt"
 set +e
 run_app_test capture --catalog "$catalog" --app fixture-one --app fixture-two --app fixture-three --workdir "$WORKDIR" >"$capture_output" 2>&1
@@ -327,8 +347,9 @@ expect_failure_contains \
 app_help="$TEST_ROOT/app-help.txt"
 "$ROOT_DIR/omarchy-restic-app-test" --help >"$app_help"
 assert_contains "$app_help" 'assert-removed' 'ajuda lista assert-removed'
-assert_contains "$ROOT_DIR/README.md" 'omarchy-restic-app-test capture' 'README documenta a captura de aplicativos'
-assert_contains "$ROOT_DIR/README.md" 'não remove aplicativos automaticamente' 'README documenta a remoção manual'
+assert_contains "$app_help" 'rehearse' 'ajuda lista o ensaio automatizado'
+assert_contains "$ROOT_DIR/README.md" 'omarchy-restic-app-test rehearse' 'README documenta o ensaio automatizado'
+assert_contains "$ROOT_DIR/README.md" 'não desinstala nem remove nada do Mint real' 'README documenta o sandbox do ensaio'
 assert_contains "$ROOT_DIR/README.md" 'STAGED ONLY' 'README documenta caminhos de sistema em staging'
 
 printf 'PASS: harness inicial\n'

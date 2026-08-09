@@ -106,31 +106,40 @@ export OMARCHY_RESTIC_VERIFY_WORKDIR="/caminho/com/espaco"
 
 ## 3. Ensaiar remoção e restauração de aplicativos
 
-O script dedicado permite escolher exatamente três aplicativos do catálogo
-`omarchy-restic-apps.conf` e testar a sequência completa sem remover nada
-automaticamente:
+O fluxo recomendado é totalmente automatizado e descartável. Ele captura
+exatamente três aplicativos do catálogo `omarchy-restic-apps.conf`, verifica a
+captura, cria um `HOME` temporário, remove somente os artefatos nesse `HOME`,
+restaura e valida novamente hashes, tipos, permissões, launchers e symlinks:
 
 ```bash
 export RESTIC_REPOSITORY="/media/$USER/Backup/omarchy-restic-v2"
 
-./omarchy-restic-app-test capture \
+./omarchy-restic-app-test rehearse \
   --app rubymine \
   --app jetbrains-toolbox \
   --app obsidian
-./omarchy-restic-app-test verify-capture
 ```
 
-Somente depois de `capture` e `verify-capture` terminarem com sucesso, feche e
-desinstale manualmente os três aplicativos. Em seguida, execute:
+Esse comando pede a senha do Restic uma vez, cria um snapshot com a tag
+`omarchy-app-test` e não desinstala nem remove nada do Mint real. O `HOME`
+temporário é apagado quando o ensaio termina com sucesso. Para preservá-lo em
+caso de diagnóstico:
 
 ```bash
-./omarchy-restic-app-test assert-removed
-./omarchy-restic-app-test restore
-./omarchy-restic-app-test validate
+./omarchy-restic-app-test rehearse \
+  --app rubymine \
+  --app jetbrains-toolbox \
+  --app obsidian \
+  --keep-stage
 ```
 
-O teste não remove aplicativos automaticamente e não usa `--delete`. O
-`restore` copia apenas os caminhos de usuário definidos no catálogo e guarda
+O ensaio automatizado equivale à sequência:
+
+```text
+capture -> verify-capture -> restore em HOME temporário -> remoção simulada -> assert-removed -> restore -> validate
+```
+
+O `restore` copia apenas os caminhos de usuário definidos no catálogo e guarda
 arquivos sobrescritos em:
 
 ```text
@@ -138,7 +147,8 @@ arquivos sobrescritos em:
 ```
 
 RubyMine, Toolbox e Obsidian precisam estar instalados no momento do `capture`
-para que a remoção e a restauração dos executáveis sejam realmente testadas.
+para que a remoção simulada e a restauração dos executáveis sejam realmente
+testadas.
 As pastas `~/.config/JetBrains/RubyMine*` comprovam o estado de configuração,
 mas não substituem um executável ausente. O catálogo usa o caminho real do
 Toolbox (`.../apps/rubymine*`) e não exige uma segunda instalação em `/opt`.
@@ -155,6 +165,10 @@ existente no catálogo.
 O snapshot deste ensaio usa a tag `omarchy-app-test` e não substitui o
 snapshot principal `omarchy-migration`. O conteúdo dos volumes Docker
 continua fora de ambos os backups.
+
+As fases `capture`, `verify-capture`, `assert-removed`, `restore` e `validate`
+continuam disponíveis separadamente para diagnóstico. Elas não são necessárias
+no fluxo normal do ensaio automatizado.
 
 ## 4. Guardar os scripts fora do disco que será apagado
 
