@@ -15,7 +15,11 @@ O backup inclui:
 - inventário de pacotes, versões, gems e pacotes npm;
 - inventário e metadados Docker, sem o conteúdo dos volumes.
 
-São excluídos somente conteúdos regeneráveis: caches, Lixeira, `node_modules`, `vendor/bundle`, `.bundle`, `tmp`, `log`, `coverage` e `.terraform` dentro do `$HOME`.
+São excluídos conteúdos regeneráveis e dados de runtime Docker: caches,
+Lixeira, `node_modules`, `vendor/bundle`, `.bundle`, `tmp`, `log`, `coverage`,
+`.terraform`, diretórios `docker/volumes` e dados Caddy montados em
+`.config/**/config/caddy` e `.config/**/data/caddy`. Bind mounts de código dos
+projetos continuam incluídos.
 
 O conteúdo do repositório Restic é criptografado. A perda da senha torna o backup irrecuperável. Nunca coloque a senha em um commit, README, script ou variável persistente.
 
@@ -70,7 +74,8 @@ O script:
 
 1. pede a senha uma única vez;
 2. cria um inventário do sistema e das ferramentas;
-3. registra containers, imagens, redes, volumes e projetos Compose Docker;
+3. registra containers, imagens, redes, volumes e projetos Compose Docker, sem
+   copiar o conteúdo dos volumes;
 4. cria um snapshot com a tag `omarchy-migration`;
 5. executa `restic check`.
 

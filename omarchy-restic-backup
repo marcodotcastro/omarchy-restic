@@ -63,6 +63,50 @@ record_command() {
   } >"$output_file" 2>&1
 }
 
+append_docker_volume_excludes() {
+  local container_id
+  local mount_record
+  local mount_source
+  local mount_destination
+  local volume_name
+  local volume_mountpoint
+  local -a container_ids=()
+  local -a volume_names=()
+
+  # Volumes named by Compose usually live outside HOME, but rootless Docker
+  # can place them inside HOME. Bind mounts for source code are intentionally
+  # preserved; only container data/config destinations are excluded here.
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    mapfile -t container_ids < <(docker ps -aq)
+    for container_id in "${container_ids[@]}"; do
+      while IFS='|' read -r mount_source mount_destination; do
+        [[ -n "$mount_source" && -n "$mount_destination" ]] || continue
+        case "$mount_destination" in
+          /config|/data)
+            case "$mount_source" in
+              "$CURRENT_HOME"|"$CURRENT_HOME"/*)
+                printf '%s\n' "$mount_source" >>"$EXCLUDE_FILE"
+                ;;
+            esac
+            ;;
+        esac
+      done < <(
+        docker inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}|{{.Destination}}{{"\n"}}{{end}}{{end}}' "$container_id" 2>/dev/null || true
+      )
+    done
+
+    mapfile -t volume_names < <(docker volume ls -q 2>/dev/null || true)
+    for volume_name in "${volume_names[@]}"; do
+      volume_mountpoint="$(docker volume inspect --format '{{.Mountpoint}}' "$volume_name" 2>/dev/null || true)"
+      case "$volume_mountpoint" in
+        "$CURRENT_HOME"|"$CURRENT_HOME"/*)
+          printf '%s\n' "$volume_mountpoint" >>"$EXCLUDE_FILE"
+          ;;
+      esac
+    done
+  fi
+}
+
 cleanup() {
   local status=$?
 
@@ -233,7 +277,7 @@ MANIFEST_FILE="$MANIFEST_DIR/omarchy-restic-manifest.txt"
   printf 'source_hostname=%s\n' "$(hostname)"
   printf 'repository=%s\n' "$REPOSITORY"
   printf 'docker_volume_content=not-backed-up\n'
-  printf 'excluded_paths=cache,trash,node_modules,vendor/bundle,.bundle,tmp,log,coverage,.terraform\n'
+  printf 'excluded_paths=cache,trash,node_modules,vendor/bundle,.bundle,tmp,log,coverage,.terraform,docker/volumes,caddy-docker-data\n'
 } >"$MANIFEST_FILE"
 
 EXCLUDE_FILE="$STAGING_DIR/restic-excludes.txt"
@@ -247,7 +291,12 @@ EXCLUDE_FILE="$STAGING_DIR/restic-excludes.txt"
   printf '%s/**/log\n' "$CURRENT_HOME"
   printf '%s/**/coverage\n' "$CURRENT_HOME"
   printf '%s/**/.terraform\n' "$CURRENT_HOME"
+  printf '%s/**/docker/volumes\n' "$CURRENT_HOME"
+  printf '%s/.config/**/config/caddy\n' "$CURRENT_HOME"
+  printf '%s/.config/**/data/caddy\n' "$CURRENT_HOME"
 } >"$EXCLUDE_FILE"
+
+append_docker_volume_excludes
 
 log "iniciando snapshot do HOME e do inventário"
 set +e
