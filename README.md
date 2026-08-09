@@ -116,7 +116,7 @@ export RESTIC_REPOSITORY="/media/$USER/Backup/omarchy-restic-v2"
 ./omarchy-restic-app-test capture \
   --app rubymine \
   --app jetbrains-toolbox \
-  --app drawio
+  --app obsidian
 ./omarchy-restic-app-test verify-capture
 ```
 
@@ -137,15 +137,20 @@ arquivos sobrescritos em:
 ~/.omarchy-restic-app-test-pre-restore-<data>-<pid>
 ```
 
-RubyMine e Toolbox precisam estar instalados no momento do `capture` para que
-a remoção e a restauração do executável sejam realmente testadas. As pastas
-`~/.config/JetBrains/RubyMine*` comprovam o estado de configuração, mas não
-substituem um executável ausente.
+RubyMine, Toolbox e Obsidian precisam estar instalados no momento do `capture`
+para que a remoção e a restauração dos executáveis sejam realmente testadas.
+As pastas `~/.config/JetBrains/RubyMine*` comprovam o estado de configuração,
+mas não substituem um executável ausente. O catálogo usa o caminho real do
+Toolbox (`.../apps/rubymine*`) e não exige uma segunda instalação em `/opt`.
 
-Entradas com instalação em `/opt` ou `/usr/share` aparecem como `STAGED ONLY`:
-os arquivos são verificados na área temporária, mas não são copiados com
-`sudo` automaticamente. O terceiro aplicativo pode ser trocado por qualquer
-ID existente no catálogo.
+Se um catálogo personalizado incluir instalação em `/opt` ou `/usr/share`,
+esses arquivos aparecem como `STAGED ONLY`: são verificados na área temporária,
+mas não são copiados com `sudo` automaticamente. Para este ensaio, Obsidian foi
+escolhido como terceiro aplicativo porque seu AppImage, symlink, launcher e
+configuração ficam no HOME e podem ser restaurados sem privilégios. O catálogo
+também inclui `Documents/Obsidian Vault`, preservando o repositório Git e seu
+remote sem exibir a URL. O terceiro aplicativo pode ser trocado por outro ID
+existente no catálogo.
 
 O snapshot deste ensaio usa a tag `omarchy-app-test` e não substitui o
 snapshot principal `omarchy-migration`. O conteúdo dos volumes Docker

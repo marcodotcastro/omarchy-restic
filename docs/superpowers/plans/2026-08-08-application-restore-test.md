@@ -13,7 +13,7 @@
 ## File map and boundaries
 
 - Create `omarchy-restic-app-test`: phase parser, catalog reader, capture, verified temporary restore, removal assertions, home-only restore, and manifest validation.
-- Create `omarchy-restic-apps.conf`: editable catalog for `rubymine`, `jetbrains-toolbox`, and `drawio`; the user may add or replace the third selection without changing the script.
+- Create `omarchy-restic-apps.conf`: editable catalog for `rubymine`, `jetbrains-toolbox`, and `obsidian`; the user may add or replace the third selection without changing the script.
 - Create `tests/omarchy-restic-app-test.sh`: executable end-to-end test with synthetic applications and a real temporary Restic repository.
 - Modify `README.md`: explain the five phases, catalog editing, password/repository variables, system-path staging, and the required order around manual uninstallation.
 - Do not modify `omarchy-restic-backup`, `omarchy-restic-restore`, or `omarchy-restic-verify` behavior in this feature. Add the new script to the existing “copy scripts to the external disk” instructions.
@@ -120,9 +120,9 @@ The parser must reject empty IDs, IDs containing whitespace or `|`, fewer or mor
 The default catalog must contain these initial records:
 
 ```text
-rubymine|RubyMine||$HOME/.config/JetBrains/RubyMine*;$HOME/.local/share/JetBrains/Toolbox/apps/rubymine*|$HOME/.local/share/JetBrains/Toolbox/apps/rubymine*;/opt/RubyMine*|$HOME/.local/share/applications/rubymine*.desktop|none|home
-jetbrains-toolbox|JetBrains Toolbox||$HOME/.local/share/JetBrains/Toolbox|$HOME/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox|$HOME/.config/autostart/jetbrains-toolbox.desktop;$HOME/.local/share/applications/jetbrains-toolbox.desktop|none|home
-drawio|draw.io||$HOME/.config/drawio|/opt/drawio;/usr/share/applications/drawio.desktop|$HOME/.local/share/applications/drawio.desktop;/usr/share/applications/drawio.desktop|none|staged
+rubymine|RubyMine|rubymine|$HOME/.config/JetBrains/RubyMine*|$HOME/.local/share/JetBrains/Toolbox/apps/rubymine*|$HOME/.local/share/applications/rubymine*.desktop|none|home
+jetbrains-toolbox|JetBrains Toolbox|jetbrains-toolbox|$HOME/.local/share/JetBrains/Toolbox|$HOME/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox|$HOME/.config/autostart/jetbrains-toolbox.desktop;$HOME/.local/share/applications/jetbrains-toolbox.desktop|none|home
+obsidian|Obsidian|obsidian|$HOME/.config/obsidian;$HOME/Documents/Obsidian Vault|$HOME/.local/bin/Obsidian.AppImage;$HOME/.local/bin/obsidian|$HOME/.local/share/applications/obsidian.desktop|none|home
 ```
 
 The capture phase will require at least one match for every `preserve_home` pattern and every `installation_paths` pattern. This makes the current absence of the RubyMine/Toolbox executable an explicit precondition failure instead of a false-positive configuration-only test.
@@ -387,7 +387,12 @@ export RESTIC_REPOSITORY="/media/$USER/Backup/omarchy-restic-v2"
 ./omarchy-restic-app-test validate
 ```
 
-Document that the current machine must first have the RubyMine and Toolbox executables installed for `capture` to perform a complete executable test. Explain that `~/.config/JetBrains/RubyMine*` is preserved as user state, while an absent Toolbox binary cannot be inferred from those settings. Add the new script and catalog to the `install` commands that copy migration tools to the external disk.
+Document that the current machine must first have the RubyMine, Toolbox, and
+Obsidian executables installed for `capture` to perform a complete executable
+test. Explain that `~/.config/JetBrains/RubyMine*` is preserved as user state,
+while an absent Toolbox binary cannot be inferred from those settings. Add the
+new script and catalog to the `install` commands that copy migration tools to
+the external disk.
 
 - [ ] **Step 4: Run documentation checks and commit.**
 

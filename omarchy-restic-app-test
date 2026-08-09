@@ -298,17 +298,10 @@ capture_phase() {
     fi
   done
 
-  {
-    printf '%s\n' "$CURRENT_HOME/.cache"
-    printf '%s\n' "$CURRENT_HOME/.local/share/Trash"
-    printf '%s/**/node_modules\n' "$CURRENT_HOME"
-    printf '%s/**/vendor/bundle\n' "$CURRENT_HOME"
-    printf '%s/**/.bundle\n' "$CURRENT_HOME"
-    printf '%s/**/tmp\n' "$CURRENT_HOME"
-    printf '%s/**/log\n' "$CURRENT_HOME"
-    printf '%s/**/coverage\n' "$CURRENT_HOME"
-    printf '%s/**/.terraform\n' "$CURRENT_HOME"
-  } >"$EXCLUDE_FILE"
+  # O teste de aplicativos precisa preservar exatamente os caminhos
+  # selecionados. Exclusões genéricas como node_modules quebram o manifest
+  # quando fazem parte da instalação de um aplicativo, como no RubyMine.
+  : >"$EXCLUDE_FILE"
 
   log "criando snapshot com a tag $APP_TEST_TAG"
   restic_cmd backup \
@@ -724,6 +717,9 @@ catalog_load() {
     [[ "$id" != *[[:space:]]* && "$id" != *'|'* ]] || die "ID inválido no catálogo: $id"
     [[ -z "${APP_NAME[$id]+present}" ]] || die "ID duplicado no catálogo: $id"
     [[ "$restore_mode" == home || "$restore_mode" == staged ]] || die "restore_mode inválido para $id: $restore_mode"
+    if [[ "$restore_mode" == home ]]; then
+      validate_home_installation_paths "$id" "$installation_paths"
+    fi
 
     APP_NAME["$id"]="$name"
     APP_COMMAND["$id"]="$command_name"
@@ -739,6 +735,23 @@ catalog_require_app() {
   local app_id="$1"
 
   [[ -n "${APP_NAME[$app_id]+present}" ]] || die "aplicativo não encontrado no catálogo: $app_id"
+}
+
+validate_home_installation_paths() {
+  local app_id="$1"
+  local installation_paths="$2"
+  local path_pattern
+
+  while IFS= read -r path_pattern; do
+    [[ -n "$path_pattern" && "$path_pattern" != none ]] || continue
+    case "$path_pattern" in
+      \$HOME/*|~/*)
+        ;;
+      *)
+        die "restore_mode=home exige caminhos de instalação dentro do HOME para $app_id: $path_pattern"
+        ;;
+    esac
+  done < <(printf '%s\n' "$installation_paths" | tr ';' '\n')
 }
 
 expand_catalog_path() {

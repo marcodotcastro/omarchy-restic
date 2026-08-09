@@ -26,6 +26,14 @@ assert_contains() {
   grep -Fq -- "$text" "$file" || fail "$description: texto ausente: $text"
 }
 
+assert_not_contains() {
+  local file="$1"
+  local text="$2"
+  local description="$3"
+
+  ! grep -Fq -- "$text" "$file" || fail "$description: texto indevido: $text"
+}
+
 expect_failure_contains() {
   local description="$1"
   local expected_text="$2"
@@ -50,6 +58,23 @@ set -e
 
 assert_status 0 "$status" '--help'
 assert_contains "$output" 'capture' 'ajuda lista capture'
+
+assert_contains \
+  "$ROOT_DIR/omarchy-restic-apps.conf" \
+  'rubymine|RubyMine|rubymine|$HOME/.config/JetBrains/RubyMine*|$HOME/.local/share/JetBrains/Toolbox/apps/rubymine*|' \
+  'RubyMine usa o caminho real case-sensitive do Toolbox'
+assert_contains \
+  "$ROOT_DIR/omarchy-restic-apps.conf" \
+  'obsidian|Obsidian|obsidian|' \
+  'catálogo oferece um terceiro aplicativo home-owned'
+assert_contains \
+  "$ROOT_DIR/omarchy-restic-apps.conf" \
+  'obsidian|Obsidian|obsidian|$HOME/.config/obsidian;$HOME/Documents/Obsidian Vault|' \
+  'catálogo preserva o vault Git do Obsidian'
+assert_not_contains \
+  "$ROOT_DIR/omarchy-restic-apps.conf" \
+  'drawio|draw.io|' \
+  'catálogo não recomenda aplicativo marcado como REMOVER'
 
 catalog="$TEST_ROOT/catalog.conf"
 printf '%s\n' \
@@ -86,6 +111,18 @@ expect_failure_contains \
   'fora do HOME' \
   bash "$ROOT_DIR/omarchy-restic-app-test" capture --catalog "$outside_catalog" --app fixture-one --app fixture-two --app fixture-three
 
+home_system_catalog="$TEST_ROOT/home-system-catalog.conf"
+printf '%s\n' \
+  'fixture-one|Fixture One||$HOME/.config/fixture-one|/opt/fixture-one||none|home' \
+  'fixture-two|Fixture Two||$HOME/.config/fixture-two|$HOME/.local/share/fixture-two/bin/fixture-two||none|home' \
+  'fixture-three|Fixture Three||$HOME/.config/fixture-three|$HOME/.local/share/fixture-three/bin/fixture-three||none|home' \
+  >"$home_system_catalog"
+
+expect_failure_contains \
+  'modo home com instalação fora do HOME' \
+  'restore_mode=home exige caminhos de instalação dentro do HOME' \
+  bash "$ROOT_DIR/omarchy-restic-app-test" capture --catalog "$home_system_catalog" --app fixture-one --app fixture-two --app fixture-three
+
 PASSWORD_FILE="$TEST_ROOT/password"
 REPOSITORY="$TEST_ROOT/repository"
 FIXTURE_HOME="$TEST_ROOT/home"
@@ -101,9 +138,11 @@ create_fixture() {
   mkdir -p \
     "$FIXTURE_HOME/.config/$app_id" \
     "$FIXTURE_HOME/.local/share/$app_id/bin" \
+    "$FIXTURE_HOME/.local/share/$app_id/bin/node_modules" \
     "$FIXTURE_HOME/.local/share/applications"
   printf '{"app":"%s","recent":"project-%s"}\n' "$app_id" "$app_id" >"$FIXTURE_HOME/.config/$app_id/settings.json"
   printf '#!/usr/bin/env bash\nprintf "fixture-%s\\n"\n' "$app_id" >"$FIXTURE_HOME/.local/share/$app_id/bin/$app_id"
+  printf 'dependency-%s\n' "$app_id" >"$FIXTURE_HOME/.local/share/$app_id/bin/node_modules/dependency.txt"
   chmod 700 "$FIXTURE_HOME/.local/share/$app_id/bin/$app_id"
   printf '[Desktop Entry]\nName=%s\nType=Application\nExec=%s\n' "$app_id" "$FIXTURE_HOME/.local/share/$app_id/bin/$app_id" >"$FIXTURE_HOME/.local/share/applications/$app_id.desktop"
 }
@@ -122,6 +161,82 @@ run_app_test() {
     RESTIC_CACHE_DIR="$RESTIC_CACHE_DIR" \
     "$ROOT_DIR/omarchy-restic-app-test" "$@"
 }
+
+realistic_catalog="$TEST_ROOT/realistic-catalog.conf"
+realistic_home="$TEST_ROOT/realistic-home"
+realistic_repository="$TEST_ROOT/realistic-repository"
+realistic_password_file="$TEST_ROOT/realistic-password"
+realistic_cache_dir="$TEST_ROOT/realistic-cache"
+realistic_workdir="$TEST_ROOT/realistic-workdir"
+realistic_path='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+printf '%s\n' \
+  '# id|name|command|preserve_home|installation_paths|launcher_paths|installer_path|restore_mode' \
+  'fixture-rubymine|RubyMine fixture||$HOME/.config/JetBrains/RubyMine2026.*|$HOME/.local/share/JetBrains/Toolbox/apps/rubymine*|$HOME/.local/share/applications/rubymine*.desktop|none|home' \
+  'fixture-toolbox|Toolbox fixture||$HOME/.local/share/JetBrains/Toolbox|$HOME/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox|$HOME/.config/autostart/jetbrains-toolbox.desktop|none|home' \
+  'fixture-obsidian|Obsidian fixture||$HOME/.config/obsidian;$HOME/Documents/Obsidian Vault|$HOME/.local/bin/Obsidian.AppImage;$HOME/.local/bin/obsidian|$HOME/.local/share/applications/obsidian.desktop|none|home' \
+  >"$realistic_catalog"
+
+mkdir -m 700 -p \
+  "$realistic_home/.config/JetBrains/RubyMine2026.1/options" \
+  "$realistic_home/.local/share/JetBrains/Toolbox/apps/rubymine/ch-0/2026.1" \
+  "$realistic_home/.local/share/JetBrains/Toolbox/bin" \
+  "$realistic_home/.config/obsidian" \
+  "$realistic_home/Documents/Obsidian Vault/.git" \
+  "$realistic_home/.local/bin" \
+  "$realistic_home/.local/share/applications" \
+  "$realistic_home/.config/autostart" \
+  "$realistic_workdir" \
+  "$realistic_cache_dir"
+printf 'recent-projects\n' >"$realistic_home/.config/JetBrains/RubyMine2026.1/options/recentProjects.xml"
+printf 'rubymine-binary\n' >"$realistic_home/.local/share/JetBrains/Toolbox/apps/rubymine/ch-0/2026.1/rubymine"
+printf '#!/usr/bin/env bash\n' >"$realistic_home/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox"
+chmod 700 "$realistic_home/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox"
+printf 'obsidian-appimage\n' >"$realistic_home/.local/bin/Obsidian.AppImage"
+chmod 755 "$realistic_home/.local/bin/Obsidian.AppImage"
+ln -s 'Obsidian.AppImage' "$realistic_home/.local/bin/obsidian"
+printf 'obsidian-state\n' >"$realistic_home/.config/obsidian/state.json"
+printf '[core]\n\tbare = false\n[remote "origin"]\n\turl = https://github.com/example/obsidian-vault.git\n' >"$realistic_home/Documents/Obsidian Vault/.git/config"
+printf 'ref: refs/heads/main\n' >"$realistic_home/Documents/Obsidian Vault/.git/HEAD"
+printf 'realistic-test-password\n' >"$realistic_password_file"
+chmod 600 "$realistic_password_file"
+RESTIC_PASSWORD_FILE="$realistic_password_file" \
+  RESTIC_CACHE_DIR="$realistic_cache_dir" \
+  restic -r "$realistic_repository" init >/dev/null
+
+run_realistic_test() {
+  HOME="$realistic_home" \
+    USER="${USER:-$(id -un)}" \
+    PATH="$realistic_path" \
+    RESTIC_REPOSITORY="$realistic_repository" \
+    RESTIC_PASSWORD_FILE="$realistic_password_file" \
+    OMARCHY_RESTIC_PASSWORD_FILE="$realistic_password_file" \
+    RESTIC_CACHE_DIR="$realistic_cache_dir" \
+    "$ROOT_DIR/omarchy-restic-app-test" "$@"
+}
+
+realistic_capture_output="$TEST_ROOT/realistic-capture.txt"
+set +e
+run_realistic_test capture \
+  --catalog "$realistic_catalog" \
+  --app fixture-rubymine \
+  --app fixture-toolbox \
+  --app fixture-obsidian \
+  --workdir "$realistic_workdir" >"$realistic_capture_output" 2>&1
+realistic_capture_status=$?
+set -e
+assert_status 0 "$realistic_capture_status" 'capture com caminhos reais do Toolbox e Obsidian'
+assert_contains "$realistic_capture_output" 'snapshot de teste criado' 'capture realista cria snapshot'
+
+realistic_verify_output="$TEST_ROOT/realistic-verify.txt"
+set +e
+run_realistic_test verify-capture \
+  --catalog "$realistic_catalog" \
+  --workdir "$realistic_workdir" >"$realistic_verify_output" 2>&1
+realistic_verify_status=$?
+set -e
+assert_status 0 "$realistic_verify_status" 'verify-capture com caminhos reais do Toolbox e Obsidian'
+assert_contains "$realistic_verify_output" 'PASS' 'verify-capture realista informa sucesso'
 
 capture_output="$TEST_ROOT/capture.txt"
 set +e
@@ -188,6 +303,7 @@ assert_status 0 "$restore_status" 'restore dos caminhos de usuário'
 assert_contains "$restore_output" 'PASS' 'restore informa sucesso'
 [[ -f "$FIXTURE_HOME/.config/fixture-one/settings.json" ]] || fail 'configuração do fixture-one não foi restaurada'
 [[ -x "$FIXTURE_HOME/.local/share/fixture-one/bin/fixture-one" ]] || fail 'executável do fixture-one não foi restaurado'
+[[ -f "$FIXTURE_HOME/.local/share/fixture-one/bin/node_modules/dependency.txt" ]] || fail 'node_modules do fixture-one não foi restaurado'
 [[ -f "$FIXTURE_HOME/.local/share/fixture-two/bin/fixture-two" ]] || fail 'executável do fixture-two não foi restaurado'
 [[ -f "$FIXTURE_HOME/.local/share/fixture-three/bin/fixture-three" ]] || fail 'executável do fixture-three não foi restaurado'
 [[ -f "$FIXTURE_HOME/unrelated.txt" ]] || fail 'arquivo não selecionado foi removido'
