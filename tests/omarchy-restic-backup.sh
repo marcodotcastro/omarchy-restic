@@ -45,6 +45,44 @@ assert_not_contains() {
   ! grep -Fq -- "$text" "$file" || fail "$description: texto indevido: $text"
 }
 
+AUTO_MOUNT="$TEST_ROOT/auto-mount"
+AUTO_HOME="$TEST_ROOT/auto-home"
+AUTO_CACHE_DIR="$TEST_ROOT/auto-cache"
+AUTO_TMP_DIR="$TEST_ROOT/auto-tmp"
+mkdir -m 700 -p "$AUTO_MOUNT" "$AUTO_HOME/project" "$AUTO_CACHE_DIR" "$AUTO_TMP_DIR"
+printf 'first backup\n' >"$AUTO_HOME/project/file.txt"
+
+run_auto_backup() {
+  local output_file="$1"
+
+  printf 'auto-password\n' | \
+    HOME="$AUTO_HOME" \
+    USER="${USER:-$(id -un)}" \
+    OMARCHY_RESTIC_MOUNT="$AUTO_MOUNT" \
+    RESTIC_CACHE_DIR="$AUTO_CACHE_DIR" \
+    TMPDIR="$AUTO_TMP_DIR" \
+    DOCKER_HOST="unix:///tmp/omarchy-restic-backup-test-no-docker.sock" \
+    bash "$ROOT_DIR/omarchy-restic-backup" >"$output_file" 2>&1
+}
+
+AUTO_FIRST_OUTPUT="$TEST_ROOT/auto-first.txt"
+set +e
+run_auto_backup "$AUTO_FIRST_OUTPUT"
+auto_first_status=$?
+set -e
+assert_status 0 "$auto_first_status" 'backup cria o repositório padrão ausente'
+assert_contains "$AUTO_FIRST_OUTPUT" 'omarchy-restic-v2' 'primeiro backup usa v2'
+[[ -d "$AUTO_MOUNT/omarchy-restic-v2" ]] || fail 'v2 não foi criado automaticamente'
+
+AUTO_SECOND_OUTPUT="$TEST_ROOT/auto-second.txt"
+set +e
+run_auto_backup "$AUTO_SECOND_OUTPUT"
+auto_second_status=$?
+set -e
+assert_status 0 "$auto_second_status" 'backup cria a próxima versão quando v2 existe'
+assert_contains "$AUTO_SECOND_OUTPUT" 'omarchy-restic-v3' 'segundo backup usa v3'
+[[ -d "$AUTO_MOUNT/omarchy-restic-v3" ]] || fail 'v3 não foi criado automaticamente'
+
 FIXTURE_HOME="$TEST_ROOT/home"
 REPOSITORY="$TEST_ROOT/backup/repository"
 PASSWORD_FILE="$TEST_ROOT/password"

@@ -31,13 +31,18 @@ O conteúdo do repositório Restic é criptografado. A perda da senha torna o ba
 - HD externo montado;
 - Docker opcional para inventário.
 
-O caminho padrão do repositório é:
+Sem uma variável de repositório explícita, o script usa esta base e inicializa o
+repositório automaticamente:
 
 ```text
 /media/$USER/Backup/omarchy-restic-v2
 ```
 
-Se o sistema montar o HD em outro caminho, defina `RESTIC_REPOSITORY` antes de executar o script.
+Se `omarchy-restic-v2` já existir, o script escolhe a próxima versão livre,
+como `omarchy-restic-v3`, sem sobrescrever um repositório existente. Se o HD
+estiver em outro caminho, defina `OMARCHY_RESTIC_MOUNT`. Defina
+`RESTIC_REPOSITORY` ou `OMARCHY_RESTIC_REPOSITORY` somente quando quiser forçar
+um repositório específico já existente.
 
 ## 1. Preparar o backup no Linux Mint
 
@@ -55,13 +60,13 @@ Para HTTPS, use:
 git clone https://github.com/marcodotcastro/omarchy-restic.git "$HOME/omarchy-restic"
 ```
 
-Confirme que o HD está montado e selecione o repositório v2:
+Confirme que o HD está montado. Não é necessário criar ou selecionar um
+repositório antes da execução:
 
 ```bash
 export BACKUP_MOUNT="/media/$USER/Backup"
-export RESTIC_REPOSITORY="$BACKUP_MOUNT/omarchy-restic-v2"
-findmnt -T "$RESTIC_REPOSITORY"
-restic snapshots
+export OMARCHY_RESTIC_MOUNT="$BACKUP_MOUNT"
+findmnt -T "$BACKUP_MOUNT"
 ```
 
 Execute o backup completo com um único comando:

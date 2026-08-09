@@ -4,9 +4,12 @@ IFS=$'\n\t'
 
 CURRENT_USER="${USER:-$(id -un)}"
 CURRENT_HOME="${HOME:?HOME não está definido}"
-DEFAULT_MOUNT="/media/${CURRENT_USER}/Backup"
+DEFAULT_MOUNT="${OMARCHY_RESTIC_MOUNT:-/media/${CURRENT_USER}/Backup}"
 DEFAULT_REPOSITORY="${DEFAULT_MOUNT}/omarchy-restic-v2"
-REPOSITORY="${OMARCHY_RESTIC_REPOSITORY:-${RESTIC_REPOSITORY:-${DEFAULT_REPOSITORY}}}"
+EXPLICIT_REPOSITORY="${OMARCHY_RESTIC_REPOSITORY:-${RESTIC_REPOSITORY:-}}"
+REPOSITORY="$EXPLICIT_REPOSITORY"
+REPOSITORY_EXPLICIT=0
+REPOSITORY_IS_NEW=0
 PASSWORD_FILE=""
 STAGING_DIR=""
 
@@ -29,6 +32,10 @@ Variáveis opcionais:
   RESTIC_REPOSITORY          alternativa ao caminho acima
   OMARCHY_RESTIC_MOUNT       ponto de montagem do HD externo
 
+Se nenhum repositório for informado, o script cria automaticamente
+omarchy-restic-v2. Se versões existentes forem encontradas, cria a próxima
+versão disponível (v3, v4, ...), sem sobrescrever um repositório existente.
+
 Padrão do repositório:
   /media/$USER/Backup/omarchy-restic-v2
 USAGE
@@ -45,6 +52,36 @@ warn() {
 die() {
   printf '[backup][erro] %s\n' "$*" >&2
   exit 1
+}
+
+select_repository() {
+  local candidate
+  local candidate_name
+  local version
+  local highest_version=1
+
+  if [[ -n "$EXPLICIT_REPOSITORY" ]]; then
+    REPOSITORY="$EXPLICIT_REPOSITORY"
+    REPOSITORY_EXPLICIT=1
+    return
+  fi
+
+  for candidate in "$DEFAULT_MOUNT"/omarchy-restic-v*; do
+    [[ -e "$candidate" ]] || continue
+    candidate_name="${candidate##*/}"
+    if [[ "$candidate_name" =~ ^omarchy-restic-v([0-9]+)$ ]]; then
+      version="${BASH_REMATCH[1]}"
+      if (( version >= 2 && version > highest_version )); then
+        highest_version="$version"
+      fi
+    fi
+  done
+
+  if (( highest_version == 1 )); then
+    REPOSITORY="$DEFAULT_MOUNT/omarchy-restic-v2"
+  else
+    REPOSITORY="$DEFAULT_MOUNT/omarchy-restic-v$((highest_version + 1))"
+  fi
 }
 
 record_command() {
@@ -142,15 +179,23 @@ done
 command -v restic >/dev/null 2>&1 || die "restic não está instalado"
 command -v mktemp >/dev/null 2>&1 || die "mktemp não está disponível"
 
+select_repository
+
 if [[ "$REPOSITORY" == /media/*/Backup/* ]]; then
-  BACKUP_MOUNT="${OMARCHY_RESTIC_MOUNT:-$DEFAULT_MOUNT}"
+  BACKUP_MOUNT="$DEFAULT_MOUNT"
   command -v mountpoint >/dev/null 2>&1 || die "mountpoint não está disponível para validar o HD externo"
   mountpoint -q "$BACKUP_MOUNT" || die "HD externo não está montado em $BACKUP_MOUNT"
 else
   BACKUP_MOUNT="${OMARCHY_RESTIC_MOUNT:-$(dirname "$(dirname "$REPOSITORY")")}" 
 fi
 
-[[ -d "$REPOSITORY" ]] || die "repositório não encontrado: $REPOSITORY"
+[[ -d "$BACKUP_MOUNT" && -w "$BACKUP_MOUNT" ]] || die "ponto de armazenamento não existe ou não permite escrita: $BACKUP_MOUNT"
+if [[ -e "$REPOSITORY" ]]; then
+  [[ -d "$REPOSITORY" ]] || die "caminho do repositório não é um diretório: $REPOSITORY"
+else
+  (( REPOSITORY_EXPLICIT == 0 )) || die "repositório não encontrado: $REPOSITORY"
+  REPOSITORY_IS_NEW=1
+fi
 
 PASSWORD_FILE="$(mktemp "${TMPDIR:-/tmp}/omarchy-restic-password.XXXXXX")"
 chmod 600 "$PASSWORD_FILE"
@@ -168,8 +213,13 @@ restic_cmd() {
   restic -r "$REPOSITORY" "$@"
 }
 
-log "validando o repositório: $REPOSITORY"
-restic_cmd snapshots --latest 1 >/dev/null
+if (( REPOSITORY_IS_NEW == 1 )); then
+  log "inicializando novo repositório: $REPOSITORY"
+  restic_cmd init
+else
+  log "validando o repositório: $REPOSITORY"
+  restic_cmd snapshots --latest 1 >/dev/null
+fi
 
 STAGING_DIR="$(mktemp -d "$BACKUP_MOUNT/.omarchy-restic-staging.XXXXXX")"
 chmod 700 "$STAGING_DIR"
