@@ -50,7 +50,13 @@ AUTO_HOME="$TEST_ROOT/auto-home"
 AUTO_CACHE_DIR="$TEST_ROOT/auto-cache"
 AUTO_TMP_DIR="$TEST_ROOT/auto-tmp"
 mkdir -m 700 -p "$AUTO_MOUNT" "$AUTO_HOME/project" "$AUTO_CACHE_DIR" "$AUTO_TMP_DIR"
+mkdir -m 700 -p "$AUTO_HOME/RubymineProjects/c2s-crm.worktrees/c2s-crm-cc-997-erros-logs/storage"
+printf 'auto-password\n' >"$TEST_ROOT/auto-password"
+chmod 600 "$TEST_ROOT/auto-password"
 printf 'first backup\n' >"$AUTO_HOME/project/file.txt"
+printf 'temporary application state\n' >"$AUTO_HOME/RubymineProjects/c2s-crm.worktrees/c2s-crm-cc-997-erros-logs/storage/cache.db"
+LOCKED_PATHS+=("$AUTO_HOME/RubymineProjects/c2s-crm.worktrees/c2s-crm-cc-997-erros-logs/storage")
+chmod 000 "${LOCKED_PATHS[@]}"
 
 run_auto_backup() {
   local output_file="$1"
@@ -73,6 +79,13 @@ set -e
 assert_status 0 "$auto_first_status" 'backup cria o repositório padrão ausente'
 assert_contains "$AUTO_FIRST_OUTPUT" 'omarchy-restic-v2' 'primeiro backup usa v2'
 [[ -d "$AUTO_MOUNT/omarchy-restic-v2" ]] || fail 'v2 não foi criado automaticamente'
+
+AUTO_FIRST_LISTING="$TEST_ROOT/auto-first-listing.txt"
+RESTIC_PASSWORD_FILE="$TEST_ROOT/auto-password" \
+  RESTIC_CACHE_DIR="$AUTO_CACHE_DIR" \
+  restic -r "$AUTO_MOUNT/omarchy-restic-v2" ls latest >"$AUTO_FIRST_LISTING"
+assert_contains "$AUTO_FIRST_LISTING" 'project/file.txt' 'arquivo normal foi salvo no primeiro backup'
+assert_not_contains "$AUTO_FIRST_LISTING" 'c2s-crm-cc-997-erros-logs/storage' 'storage temporário ficou fora do primeiro backup'
 
 AUTO_SECOND_OUTPUT="$TEST_ROOT/auto-second.txt"
 set +e

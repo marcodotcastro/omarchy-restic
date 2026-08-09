@@ -327,7 +327,7 @@ MANIFEST_FILE="$MANIFEST_DIR/omarchy-restic-manifest.txt"
   printf 'source_hostname=%s\n' "$(hostname)"
   printf 'repository=%s\n' "$REPOSITORY"
   printf 'docker_volume_content=not-backed-up\n'
-  printf 'excluded_paths=cache,trash,node_modules,vendor/bundle,.bundle,tmp,log,coverage,.terraform,docker/volumes,caddy-docker-data\n'
+  printf 'excluded_paths=cache,trash,node_modules,vendor/bundle,.bundle,tmp,log,coverage,.terraform,docker/volumes,caddy-docker-data,project-storage\n'
 } >"$MANIFEST_FILE"
 
 EXCLUDE_FILE="$STAGING_DIR/restic-excludes.txt"
@@ -344,6 +344,8 @@ EXCLUDE_FILE="$STAGING_DIR/restic-excludes.txt"
   printf '%s/**/docker/volumes\n' "$CURRENT_HOME"
   printf '%s/.config/**/config/caddy\n' "$CURRENT_HOME"
   printf '%s/.config/**/data/caddy\n' "$CURRENT_HOME"
+  printf '%s/**/storage\n' "$CURRENT_HOME/RubymineProjects"
+  printf '%s/**/storage\n' "$CURRENT_HOME/DesenvolvendoMe"
 } >"$EXCLUDE_FILE"
 
 append_docker_volume_excludes

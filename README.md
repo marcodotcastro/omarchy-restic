@@ -19,7 +19,9 @@ São excluídos conteúdos regeneráveis e dados de runtime Docker: caches,
 Lixeira, `node_modules`, `vendor/bundle`, `.bundle`, `tmp`, `log`, `coverage`,
 `.terraform`, diretórios `docker/volumes` e dados Caddy montados em
 `.config/**/config/caddy` e `.config/**/data/caddy`. Bind mounts de código dos
-projetos continuam incluídos.
+projetos continuam incluídos. Também ficam fora os diretórios `storage` dentro
+de `RubymineProjects` e `DesenvolvendoMe`, tratados como estado temporário das
+aplicações.
 
 O conteúdo do repositório Restic é criptografado. A perda da senha torna o backup irrecuperável. Nunca coloque a senha em um commit, README, script ou variável persistente.
 
